@@ -8,7 +8,7 @@ API_KEY = 'your_api_key'
 API_URL = 'https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest'
 DEFAULT_SYMBOL = 'BTC'
 DEFAULT_CONVERT = 'USD'
-DEFAULT_INTERVAL = 60  # Интервал обновления в секундах
+DEFAULT_INTERVAL = 60
 
 HEADERS = {
     'X-CMC_PRO_API_KEY': API_KEY
@@ -24,7 +24,7 @@ def get_cryptocurrency_price(symbol=DEFAULT_SYMBOL, convert=DEFAULT_CONVERT):
     }
     try:
         response = requests.get(API_URL, headers=HEADERS, params=params)
-        response.raise_for_status()  # Проверка на успешный ответ
+        response.raise_for_status()
         data = response.json()
         price = data['data'][symbol]['quote'][convert]['price']
         return price
