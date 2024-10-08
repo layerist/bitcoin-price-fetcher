@@ -28,7 +28,7 @@ logging.basicConfig(
 def get_cryptocurrency_price(symbol=DEFAULT_SYMBOL, convert=DEFAULT_CONVERT):
     """
     Fetches the latest price of a cryptocurrency.
-
+    
     :param symbol: The cryptocurrency symbol (e.g., 'BTC').
     :param convert: The currency to convert to (e.g., 'USD').
     :return: The current price or None if the request fails.
@@ -44,11 +44,15 @@ def get_cryptocurrency_price(symbol=DEFAULT_SYMBOL, convert=DEFAULT_CONVERT):
             # Extract price from response
             price = data['data'][symbol]['quote'][convert]['price']
             return price
-        except (HTTPError, RequestException) as e:
+        
+        except HTTPError as e:
+            logging.error(f"HTTP error occurred: {e}. Retrying... ({attempt + 1}/{MAX_RETRIES})")
+        except RequestException as e:
             logging.error(f"Request error: {e}. Retrying... ({attempt + 1}/{MAX_RETRIES})")
         except KeyError as e:
-            logging.error(f"Data parsing error: Missing key {e}")
+            logging.error(f"Data parsing error: Missing key {e}. Aborting.")
             return None  # Fail immediately if the structure is wrong
+        
         time.sleep(BACKOFF_FACTOR ** attempt)  # Exponential backoff in case of failure
 
     logging.error(f"Failed to retrieve price for {symbol} after {MAX_RETRIES} attempts.")
@@ -57,7 +61,7 @@ def get_cryptocurrency_price(symbol=DEFAULT_SYMBOL, convert=DEFAULT_CONVERT):
 def main(symbol=DEFAULT_SYMBOL, convert=DEFAULT_CONVERT, interval=DEFAULT_INTERVAL):
     """
     Main loop to track cryptocurrency prices at regular intervals.
-
+    
     :param symbol: The cryptocurrency symbol to track.
     :param convert: The currency to convert the price to.
     :param interval: Time interval between updates, in seconds.
@@ -79,6 +83,10 @@ def main(symbol=DEFAULT_SYMBOL, convert=DEFAULT_CONVERT, interval=DEFAULT_INTERV
     except KeyboardInterrupt:
         logging.info("Script stopped by the user.")
         print("Script stopped by the user.")
+    except Exception as e:
+        logging.error(f"An unexpected error occurred: {e}")
+        print(f"An error occurred: {e}")
+        raise
 
 if __name__ == '__main__':
     # Command-line argument parsing
