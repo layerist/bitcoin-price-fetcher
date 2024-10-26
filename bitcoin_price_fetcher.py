@@ -37,7 +37,7 @@ def get_cryptocurrency_price(symbol=DEFAULT_SYMBOL, convert=DEFAULT_CONVERT):
 
     for attempt in range(MAX_RETRIES):
         try:
-            response = requests.get(API_URL, headers=HEADERS, params=params)
+            response = requests.get(API_URL, headers=HEADERS, params=params, timeout=10)
             response.raise_for_status()
             data = response.json()
 
@@ -45,15 +45,12 @@ def get_cryptocurrency_price(symbol=DEFAULT_SYMBOL, convert=DEFAULT_CONVERT):
             price = data['data'][symbol]['quote'][convert]['price']
             return price
         
-        except HTTPError as e:
-            logging.error(f"HTTP error occurred: {e}. Retrying... ({attempt + 1}/{MAX_RETRIES})")
-        except RequestException as e:
-            logging.error(f"Request error: {e}. Retrying... ({attempt + 1}/{MAX_RETRIES})")
+        except (HTTPError, RequestException) as e:
+            logging.warning(f"Attempt {attempt + 1}/{MAX_RETRIES} - Error: {e}")
+            time.sleep(BACKOFF_FACTOR ** attempt)
         except KeyError as e:
-            logging.error(f"Data parsing error: Missing key {e}. Aborting.")
+            logging.error(f"Unexpected response structure: missing key {e}. Aborting.")
             return None  # Fail immediately if the structure is wrong
-        
-        time.sleep(BACKOFF_FACTOR ** attempt)  # Exponential backoff in case of failure
 
     logging.error(f"Failed to retrieve price for {symbol} after {MAX_RETRIES} attempts.")
     return None
@@ -66,7 +63,7 @@ def main(symbol=DEFAULT_SYMBOL, convert=DEFAULT_CONVERT, interval=DEFAULT_INTERV
     :param convert: The currency to convert the price to.
     :param interval: Time interval between updates, in seconds.
     """
-    logging.info(f"Started tracking price for {symbol} in {convert} every {interval} seconds.")
+    logging.info(f"Starting price tracking for {symbol} in {convert} every {interval} seconds.")
     
     try:
         while True:
@@ -76,17 +73,16 @@ def main(symbol=DEFAULT_SYMBOL, convert=DEFAULT_CONVERT, interval=DEFAULT_INTERV
                 print(f"The current price of {symbol} in {convert} is ${price:.2f}")
                 logging.info(f"Price of {symbol} in {convert}: ${price:.2f}")
             else:
-                print(f"Failed to retrieve the price of {symbol} in {convert}.")
+                print(f"Failed to retrieve the price of {symbol} in {convert}. Check logs for details.")
             
             time.sleep(interval)
     
     except KeyboardInterrupt:
-        logging.info("Script stopped by the user.")
+        logging.info("Script interrupted by the user.")
         print("Script stopped by the user.")
     except Exception as e:
-        logging.error(f"An unexpected error occurred: {e}")
+        logging.critical(f"Unexpected error: {e}", exc_info=True)
         print(f"An error occurred: {e}")
-        raise
 
 if __name__ == '__main__':
     # Command-line argument parsing
