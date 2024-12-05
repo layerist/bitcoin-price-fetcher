@@ -2,6 +2,7 @@ import requests
 import time
 import logging
 import argparse
+from typing import Optional
 from requests.exceptions import HTTPError, RequestException
 
 # Configuration
@@ -13,19 +14,28 @@ DEFAULT_INTERVAL = 60
 MAX_RETRIES = 5
 BACKOFF_FACTOR = 2
 
+# Logging configuration
+def configure_logging(log_level: str = "INFO") -> None:
+    """
+    Configures logging settings for the application.
+
+    :param log_level: The logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL).
+    """
+    numeric_level = getattr(logging, log_level.upper(), logging.INFO)
+    logging.basicConfig(
+        filename='cryptocurrency_price.log',
+        level=numeric_level,
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
+    logging.getLogger().addHandler(logging.StreamHandler())  # Log to console as well
+
+
 # Headers for the API request
 HEADERS = {
     'X-CMC_PRO_API_KEY': API_KEY
 }
 
-# Logging configuration
-logging.basicConfig(
-    filename='cryptocurrency_price.log',
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-
-def fetch_cryptocurrency_price(symbol: str, convert: str) -> float | None:
+def fetch_cryptocurrency_price(symbol: str, convert: str) -> Optional[float]:
     """
     Fetch the latest price of a cryptocurrency from CoinMarketCap API.
     
@@ -43,9 +53,10 @@ def fetch_cryptocurrency_price(symbol: str, convert: str) -> float | None:
 
             # Extract price
             price = data['data'][symbol]['quote'][convert]['price']
+            logging.debug(f"API response: {data}")
             return price
         except KeyError as e:
-            logging.error(f"Response structure missing key {e}. Aborting further attempts.")
+            logging.error(f"Response structure missing key: {e}. Aborting further attempts.")
             return None
         except (HTTPError, RequestException) as e:
             logging.warning(f"Attempt {attempt} failed: {e}. Retrying after {BACKOFF_FACTOR ** attempt} seconds.")
@@ -89,14 +100,17 @@ if __name__ == '__main__':
     parser.add_argument('--symbol', type=str, default=DEFAULT_SYMBOL, help='Cryptocurrency symbol (e.g., BTC).')
     parser.add_argument('--convert', type=str, default=DEFAULT_CONVERT, help='Currency to convert to (e.g., USD).')
     parser.add_argument('--interval', type=int, default=DEFAULT_INTERVAL, help='Interval in seconds between updates.')
+    parser.add_argument('--log-level', type=str, default="INFO", help='Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL).')
 
     # Parse arguments
     args = parser.parse_args()
 
     # Validate interval
     if args.interval <= 0:
-        logging.error("Interval must be a positive integer.")
         print("Error: Interval must be a positive integer.")
+        logging.error("Interval must be a positive integer.")
     else:
+        # Configure logging
+        configure_logging(args.log_level)
         # Start tracking
         track_prices(symbol=args.symbol, convert=args.convert, interval=args.interval)
