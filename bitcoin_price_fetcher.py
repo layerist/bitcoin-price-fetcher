@@ -13,6 +13,7 @@ DEFAULT_CONVERT = 'USD'
 DEFAULT_INTERVAL = 60
 MAX_RETRIES = 5
 BACKOFF_FACTOR = 2
+LOG_FILE = 'cryptocurrency_price.log'
 
 # Logging configuration
 def configure_logging(log_level: str = "INFO") -> None:
@@ -23,12 +24,15 @@ def configure_logging(log_level: str = "INFO") -> None:
     """
     numeric_level = getattr(logging, log_level.upper(), logging.INFO)
     logging.basicConfig(
-        filename='cryptocurrency_price.log',
+        filename=LOG_FILE,
         level=numeric_level,
-        format='%(asctime)s - %(levelname)s - %(message)s'
+        format='%(asctime)s - %(levelname)s - %(message)s',
     )
-    logging.getLogger().addHandler(logging.StreamHandler())  # Log to console as well
-
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(numeric_level)
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    console_handler.setFormatter(formatter)
+    logging.getLogger().addHandler(console_handler)
 
 # Headers for the API request
 HEADERS = {
@@ -52,15 +56,16 @@ def fetch_cryptocurrency_price(symbol: str, convert: str) -> Optional[float]:
             data = response.json()
 
             # Extract price
-            price = data['data'][symbol]['quote'][convert]['price']
+            price = data['data'][symbol.upper()]['quote'][convert.upper()]['price']
             logging.debug(f"API response: {data}")
             return price
         except KeyError as e:
             logging.error(f"Response structure missing key: {e}. Aborting further attempts.")
             return None
         except (HTTPError, RequestException) as e:
-            logging.warning(f"Attempt {attempt} failed: {e}. Retrying after {BACKOFF_FACTOR ** attempt} seconds.")
-            time.sleep(BACKOFF_FACTOR ** attempt)
+            wait_time = BACKOFF_FACTOR ** attempt
+            logging.warning(f"Attempt {attempt} failed: {e}. Retrying in {wait_time} seconds.")
+            time.sleep(wait_time)
         except Exception as e:
             logging.critical(f"Unexpected error: {e}", exc_info=True)
             break
@@ -76,15 +81,15 @@ def track_prices(symbol: str, convert: str, interval: int) -> None:
     :param convert: The currency to convert the price to.
     :param interval: Time interval between updates, in seconds.
     """
-    logging.info(f"Starting price tracking for {symbol} in {convert}, interval: {interval}s.")
+    logging.info(f"Starting price tracking for {symbol.upper()} in {convert.upper()}, interval: {interval}s.")
     try:
         while True:
             price = fetch_cryptocurrency_price(symbol, convert)
             if price is not None:
-                print(f"The current price of {symbol} in {convert} is ${price:.2f}")
-                logging.info(f"Price of {symbol} in {convert}: ${price:.2f}")
+                print(f"The current price of {symbol.upper()} in {convert.upper()} is ${price:.2f}")
+                logging.info(f"Price of {symbol.upper()} in {convert.upper()}: ${price:.2f}")
             else:
-                print(f"Failed to retrieve the price of {symbol} in {convert}. Check logs for details.")
+                print(f"Failed to retrieve the price of {symbol.upper()} in {convert.upper()}. Check logs for details.")
             
             time.sleep(interval)
     except KeyboardInterrupt:
