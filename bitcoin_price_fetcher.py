@@ -2,18 +2,27 @@ import requests
 import time
 import logging
 import argparse
+import sys
 from typing import Optional
 from requests.exceptions import HTTPError, RequestException
 
 # Configuration
-API_KEY = 'your_api_key'
-API_URL = 'https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest'
-DEFAULT_SYMBOL = 'BTC'
-DEFAULT_CONVERT = 'USD'
-DEFAULT_INTERVAL = 60
-MAX_RETRIES = 5
-BACKOFF_FACTOR = 2
-LOG_FILE = 'cryptocurrency_price.log'
+CONFIG = {
+    "api_key": "your_api_key",
+    "api_url": "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest",
+    "default_symbol": "BTC",
+    "default_convert": "USD",
+    "default_interval": 60,
+    "max_retries": 5,
+    "backoff_factor": 2,
+    "log_file": "cryptocurrency_price.log",
+    "request_timeout": 10,
+}
+
+# Headers for the API request
+HEADERS = {
+    "X-CMC_PRO_API_KEY": CONFIG["api_key"]
+}
 
 # Logging configuration
 def configure_logging(log_level: str = "INFO") -> None:
@@ -24,20 +33,15 @@ def configure_logging(log_level: str = "INFO") -> None:
     """
     numeric_level = getattr(logging, log_level.upper(), logging.INFO)
     logging.basicConfig(
-        filename=LOG_FILE,
+        filename=CONFIG["log_file"],
         level=numeric_level,
-        format='%(asctime)s - %(levelname)s - %(message)s',
+        format="%(asctime)s - %(levelname)s - %(message)s",
     )
     console_handler = logging.StreamHandler()
     console_handler.setLevel(numeric_level)
-    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
     console_handler.setFormatter(formatter)
     logging.getLogger().addHandler(console_handler)
-
-# Headers for the API request
-HEADERS = {
-    'X-CMC_PRO_API_KEY': API_KEY
-}
 
 def fetch_cryptocurrency_price(symbol: str, convert: str) -> Optional[float]:
     """
@@ -47,30 +51,35 @@ def fetch_cryptocurrency_price(symbol: str, convert: str) -> Optional[float]:
     :param convert: The currency to convert to (e.g., 'USD').
     :return: The current price or None if the request fails.
     """
-    params = {'symbol': symbol, 'convert': convert}
-    for attempt in range(1, MAX_RETRIES + 1):
+    params = {"symbol": symbol, "convert": convert}
+    for attempt in range(1, CONFIG["max_retries"] + 1):
         try:
-            logging.info(f"Fetching price for {symbol} in {convert} (Attempt {attempt}/{MAX_RETRIES}).")
-            response = requests.get(API_URL, headers=HEADERS, params=params, timeout=10)
+            logging.info(f"Fetching price for {symbol} in {convert} (Attempt {attempt}/{CONFIG['max_retries']}).")
+            response = requests.get(
+                CONFIG["api_url"],
+                headers=HEADERS,
+                params=params,
+                timeout=CONFIG["request_timeout"]
+            )
             response.raise_for_status()
             data = response.json()
 
             # Extract price
-            price = data['data'][symbol.upper()]['quote'][convert.upper()]['price']
+            price = data["data"][symbol.upper()]["quote"][convert.upper()]["price"]
             logging.debug(f"API response: {data}")
             return price
         except KeyError as e:
             logging.error(f"Response structure missing key: {e}. Aborting further attempts.")
             return None
         except (HTTPError, RequestException) as e:
-            wait_time = BACKOFF_FACTOR ** attempt
+            wait_time = CONFIG["backoff_factor"] ** attempt
             logging.warning(f"Attempt {attempt} failed: {e}. Retrying in {wait_time} seconds.")
             time.sleep(wait_time)
         except Exception as e:
             logging.critical(f"Unexpected error: {e}", exc_info=True)
             break
 
-    logging.error(f"Failed to retrieve price for {symbol} after {MAX_RETRIES} attempts.")
+    logging.error(f"Failed to retrieve price for {symbol} after {CONFIG['max_retries']} attempts.")
     return None
 
 def track_prices(symbol: str, convert: str, interval: int) -> None:
@@ -98,14 +107,16 @@ def track_prices(symbol: str, convert: str, interval: int) -> None:
     except Exception as e:
         logging.critical(f"Unexpected error: {e}", exc_info=True)
         print(f"An error occurred: {e}")
+    finally:
+        sys.exit(0)
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     # Command-line argument parsing
-    parser = argparse.ArgumentParser(description='Track cryptocurrency prices in real-time.')
-    parser.add_argument('--symbol', type=str, default=DEFAULT_SYMBOL, help='Cryptocurrency symbol (e.g., BTC).')
-    parser.add_argument('--convert', type=str, default=DEFAULT_CONVERT, help='Currency to convert to (e.g., USD).')
-    parser.add_argument('--interval', type=int, default=DEFAULT_INTERVAL, help='Interval in seconds between updates.')
-    parser.add_argument('--log-level', type=str, default="INFO", help='Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL).')
+    parser = argparse.ArgumentParser(description="Track cryptocurrency prices in real-time.")
+    parser.add_argument("--symbol", type=str, default=CONFIG["default_symbol"], help="Cryptocurrency symbol (e.g., BTC).")
+    parser.add_argument("--convert", type=str, default=CONFIG["default_convert"], help="Currency to convert to (e.g., USD).")
+    parser.add_argument("--interval", type=int, default=CONFIG["default_interval"], help="Interval in seconds between updates.")
+    parser.add_argument("--log-level", type=str, default="INFO", help="Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL).")
 
     # Parse arguments
     args = parser.parse_args()
@@ -114,6 +125,7 @@ if __name__ == '__main__':
     if args.interval <= 0:
         print("Error: Interval must be a positive integer.")
         logging.error("Interval must be a positive integer.")
+        sys.exit(1)
     else:
         # Configure logging
         configure_logging(args.log_level)
