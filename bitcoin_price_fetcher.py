@@ -58,7 +58,7 @@ def fetch_cryptocurrency_price(symbol: str, convert: str) -> Optional[float]:
             logging.error(f"Invalid response format: {e}")
             break
         except (HTTPError, RequestException) as e:
-            wait_time = CONFIG["backoff_factor"] ** (attempt + 1)
+            wait_time = CONFIG["backoff_factor"] ** attempt
             logging.warning(f"Attempt {attempt + 1} failed: {e}. Retrying in {wait_time} seconds.")
             time.sleep(wait_time)
         except Exception as e:
