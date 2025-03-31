@@ -22,9 +22,7 @@ CONFIG = {
 HEADERS = {"X-CMC_PRO_API_KEY": CONFIG["api_key"]}
 
 def configure_logging(log_level: str = "INFO") -> None:
-    """
-    Configures logging settings.
-    """
+    """Configures logging settings."""
     numeric_level = getattr(logging, log_level.upper(), logging.INFO)
     logging.basicConfig(
         filename=CONFIG["log_file"],
@@ -38,14 +36,12 @@ def configure_logging(log_level: str = "INFO") -> None:
     logging.getLogger().addHandler(console_handler)
 
 def fetch_cryptocurrency_price(symbol: str, convert: str) -> Optional[float]:
-    """
-    Fetch the latest price of a cryptocurrency.
-    """
+    """Fetch the latest price of a cryptocurrency."""
     params = {"symbol": symbol.upper(), "convert": convert.upper()}
     
-    for attempt in range(CONFIG["max_retries"]):
+    for attempt in range(1, CONFIG["max_retries"] + 1):
         try:
-            logging.info(f"Fetching price for {symbol.upper()} in {convert.upper()} (Attempt {attempt + 1}).")
+            logging.info(f"Fetching price for {symbol.upper()} in {convert.upper()} (Attempt {attempt}).")
             response = requests.get(
                 CONFIG["api_url"], headers=HEADERS, params=params, timeout=CONFIG["request_timeout"]
             )
@@ -56,22 +52,20 @@ def fetch_cryptocurrency_price(symbol: str, convert: str) -> Optional[float]:
             return price
         except (KeyError, TypeError) as e:
             logging.error(f"Invalid response format: {e}")
-            break
+            return None
         except (HTTPError, RequestException) as e:
             wait_time = CONFIG["backoff_factor"] ** attempt
-            logging.warning(f"Attempt {attempt + 1} failed: {e}. Retrying in {wait_time} seconds.")
+            logging.warning(f"Attempt {attempt} failed: {e}. Retrying in {wait_time} seconds.")
             time.sleep(wait_time)
         except Exception as e:
             logging.critical(f"Unexpected error: {e}", exc_info=True)
-            break
+            return None
     
     logging.error(f"Failed to retrieve price for {symbol.upper()} after {CONFIG['max_retries']} attempts.")
     return None
 
 def track_prices(symbol: str, convert: str, interval: int) -> None:
-    """
-    Tracks cryptocurrency prices at regular intervals.
-    """
+    """Tracks cryptocurrency prices at regular intervals."""
     logging.info(f"Tracking {symbol.upper()} in {convert.upper()} every {interval} seconds.")
     
     try:
