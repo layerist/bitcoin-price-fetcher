@@ -3,6 +3,7 @@ import time
 import logging
 import argparse
 import sys
+import random
 from typing import Optional
 from requests.exceptions import HTTPError, RequestException
 
@@ -21,96 +22,108 @@ CONFIG = {
 
 HEADERS = {"X-CMC_PRO_API_KEY": CONFIG["api_key"]}
 
+
 def configure_logging(log_level: str = "INFO") -> None:
-    """Configure logging for both file and console output."""
-    numeric_level = getattr(logging, log_level.upper(), logging.INFO)
+    """Configure logging for both file and console outputs."""
+    log = logging.getLogger()
+    log.setLevel(getattr(logging, log_level.upper(), logging.INFO))
 
-    logging.basicConfig(
-        filename=CONFIG["log_file"],
-        level=numeric_level,
-        format="%(asctime)s - %(levelname)s - %(message)s",
-    )
+    # Avoid duplicate handlers
+    if log.hasHandlers():
+        log.handlers.clear()
 
-    console = logging.StreamHandler()
-    console.setLevel(numeric_level)
-    console.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
-    logging.getLogger().addHandler(console)
+    file_handler = logging.FileHandler(CONFIG["log_file"])
+    file_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+    log.addHandler(file_handler)
+
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+    log.addHandler(console_handler)
+
 
 def fetch_price(symbol: str, convert: str) -> Optional[float]:
-    """Fetch the current price for a given cryptocurrency symbol and currency."""
+    """Fetch the current price for the given cryptocurrency symbol."""
     params = {"symbol": symbol.upper(), "convert": convert.upper()}
 
     for attempt in range(1, CONFIG["max_retries"] + 1):
         try:
-            logging.info(f"Fetching {symbol.upper()} in {convert.upper()} (Attempt {attempt})...")
+            logging.info(f"Requesting {symbol.upper()} in {convert.upper()} (Attempt {attempt})...")
             response = requests.get(
                 CONFIG["api_url"],
                 headers=HEADERS,
                 params=params,
-                timeout=CONFIG["request_timeout"]
+                timeout=CONFIG["request_timeout"],
             )
             response.raise_for_status()
-            data = response.json()
 
+            data = response.json()
             price = data["data"][symbol.upper()]["quote"][convert.upper()]["price"]
-            logging.debug(f"API Response: {data}")
+            logging.debug(f"Response data: {data}")
             return price
 
         except (KeyError, TypeError) as e:
-            logging.error(f"Unexpected response structure: {e}")
+            logging.error(f"Invalid response structure: {e}")
             return None
 
         except (HTTPError, RequestException) as e:
-            wait_time = CONFIG["backoff_factor"] ** attempt
-            logging.warning(f"Request failed (Attempt {attempt}): {e}. Retrying in {wait_time}s...")
+            wait_time = CONFIG["backoff_factor"] ** attempt + random.uniform(0, 1)
+            logging.warning(f"Request failed: {e}. Retrying in {wait_time:.2f}s...")
             time.sleep(wait_time)
 
         except Exception as e:
-            logging.critical("Unhandled exception during price fetch", exc_info=True)
+            logging.critical("Unhandled exception while fetching price", exc_info=True)
             return None
 
-    logging.error(f"Max retries reached. Failed to fetch {symbol.upper()} in {convert.upper()}.")
+    logging.error(f"Failed to fetch price after {CONFIG['max_retries']} attempts.")
     return None
 
+
 def track_prices(symbol: str, convert: str, interval: int) -> None:
-    """Continuously fetch and display the price at regular intervals."""
-    logging.info(f"Started tracking {symbol.upper()} in {convert.upper()} every {interval} seconds.")
-    
+    """Track and log the cryptocurrency price at regular intervals."""
+    logging.info(f"Tracking {symbol.upper()} in {convert.upper()} every {interval} seconds.")
+
     try:
         while True:
             price = fetch_price(symbol, convert)
             if price is not None:
-                logging.info(f"{symbol.upper()} in {convert.upper()}: ${price:.2f}")
-                print(f"Current {symbol.upper()} price in {convert.upper()}: ${price:.2f}")
+                message = f"{symbol.upper()} in {convert.upper()}: ${price:.2f}"
+                logging.info(message)
+                print(message)
             else:
                 print(f"Could not retrieve price for {symbol.upper()} in {convert.upper()}.")
+
             time.sleep(interval)
 
     except KeyboardInterrupt:
-        logging.info("Tracking interrupted by user.")
+        logging.info("Tracking stopped by user.")
         print("\nTracking stopped.")
-    except Exception as e:
-        logging.critical("An unexpected error occurred.", exc_info=True)
-        print(f"An error occurred: {e}")
-    finally:
-        sys.exit(0)
 
-def parse_arguments():
+    except Exception as e:
+        logging.critical("Unexpected error occurred during tracking.", exc_info=True)
+        print(f"Error: {e}")
+
+
+def parse_arguments() -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(description="Track cryptocurrency prices in real-time.")
     parser.add_argument("--symbol", type=str, default=CONFIG["default_symbol"], help="Cryptocurrency symbol (e.g., BTC)")
     parser.add_argument("--convert", type=str, default=CONFIG["default_convert"], help="Currency to convert to (e.g., USD)")
-    parser.add_argument("--interval", type=int, default=CONFIG["default_interval"], help="Seconds between updates (must be > 0)")
+    parser.add_argument("--interval", type=int, default=CONFIG["default_interval"], help="Seconds between updates")
     parser.add_argument("--log-level", type=str, default="INFO", help="Logging level: DEBUG, INFO, WARNING, ERROR, CRITICAL")
 
     args = parser.parse_args()
 
     if args.interval <= 0:
-        sys.exit("Error: Interval must be a positive integer.")
+        parser.error("Interval must be a positive integer.")
 
     return args
 
-if __name__ == "__main__":
+
+def main():
     args = parse_arguments()
     configure_logging(args.log_level)
     track_prices(args.symbol, args.convert, args.interval)
+
+
+if __name__ == "__main__":
+    main()
