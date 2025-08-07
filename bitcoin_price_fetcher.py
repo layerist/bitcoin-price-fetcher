@@ -5,37 +5,44 @@ import random
 import logging
 import argparse
 import requests
+from dataclasses import dataclass
 from typing import Optional, Dict, Any
 from requests.exceptions import HTTPError, Timeout, RequestException
 
-# Configuration
-CONFIG = {
-    "api_key": os.getenv("CMC_API_KEY", "your_api_key"),
-    "api_url": "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest",
-    "default_symbol": "BTC",
-    "default_convert": "USD",
-    "default_interval": 60,
-    "max_retries": 5,
-    "backoff_factor": 2,
-    "max_backoff": 60,
-    "log_file": f"crypto_price_{int(time.time())}.log",
-    "request_timeout": 10,
-}
 
-HEADERS = {"X-CMC_PRO_API_KEY": CONFIG["api_key"]}
+@dataclass
+class Config:
+    api_key: str
+    api_url: str = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest"
+    default_symbol: str = "BTC"
+    default_convert: str = "USD"
+    default_interval: int = 60
+    max_retries: int = 5
+    backoff_factor: int = 2
+    max_backoff: int = 60
+    request_timeout: int = 10
+    log_file: str = f"crypto_price_{int(time.time())}.log"
 
 
-def configure_logging(log_level: str = "INFO") -> None:
-    """Configure logging to both console and file."""
+def load_config() -> Config:
+    api_key = os.getenv("CMC_API_KEY")
+    if not api_key:
+        logging.critical("CMC_API_KEY environment variable is not set.")
+        sys.exit("Error: Missing CMC_API_KEY environment variable.")
+    return Config(api_key=api_key)
+
+
+def setup_logging(log_file: str, level: str = "INFO") -> None:
+    """Set up logging to console and file."""
     logger = logging.getLogger()
-    logger.setLevel(getattr(logging, log_level.upper(), logging.INFO))
+    logger.setLevel(getattr(logging, level.upper(), logging.INFO))
 
     if logger.hasHandlers():
         logger.handlers.clear()
 
-    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
 
-    file_handler = logging.FileHandler(CONFIG["log_file"])
+    file_handler = logging.FileHandler(log_file)
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
 
@@ -44,55 +51,59 @@ def configure_logging(log_level: str = "INFO") -> None:
     logger.addHandler(console_handler)
 
 
-def exponential_backoff(attempt: int) -> float:
-    """Calculate exponential backoff with jitter."""
-    return min(CONFIG["backoff_factor"] ** attempt + random.uniform(0, 1), CONFIG["max_backoff"])
+def exponential_backoff(attempt: int, factor: int, max_backoff: int) -> float:
+    """Return exponential backoff time with jitter."""
+    return min(factor ** attempt + random.uniform(0, 1), max_backoff)
 
 
-def fetch_price(symbol: str, convert: str) -> Optional[float]:
-    """Fetch the current price of a cryptocurrency from CoinMarketCap."""
+def fetch_price(
+    config: Config,
+    symbol: str,
+    convert: str
+) -> Optional[float]:
+    """Fetch the current price of a cryptocurrency."""
+    headers = {"X-CMC_PRO_API_KEY": config.api_key}
     params = {"symbol": symbol.upper(), "convert": convert.upper()}
 
-    for attempt in range(1, CONFIG["max_retries"] + 1):
+    for attempt in range(1, config.max_retries + 1):
         try:
-            logging.info(f"Requesting {symbol.upper()} in {convert.upper()} (attempt {attempt})...")
+            logging.info(f"[Attempt {attempt}] Fetching {symbol.upper()} in {convert.upper()}...")
             response = requests.get(
-                CONFIG["api_url"],
-                headers=HEADERS,
+                config.api_url,
+                headers=headers,
                 params=params,
-                timeout=CONFIG["request_timeout"]
+                timeout=config.request_timeout
             )
             response.raise_for_status()
 
-            data: Dict[str, Any] = response.json()
+            data = response.json()
             price = data["data"][symbol.upper()]["quote"][convert.upper()]["price"]
-            logging.debug(f"Full API response: {data}")
+            logging.debug(f"API response: {data}")
             return float(price)
 
         except KeyError as e:
-            logging.error(f"Malformed API response: {e}")
+            logging.error(f"Malformed response (missing key): {e}")
             return None
 
         except (HTTPError, Timeout, RequestException) as e:
-            wait = exponential_backoff(attempt)
-            logging.warning(f"Request failed: {e}. Retrying in {wait:.2f}s...")
-            time.sleep(wait)
+            wait_time = exponential_backoff(attempt, config.backoff_factor, config.max_backoff)
+            logging.warning(f"Request failed: {e}. Retrying in {wait_time:.2f}s...")
+            time.sleep(wait_time)
 
-        except Exception as e:
-            logging.exception("Unexpected error while fetching price")
+        except Exception:
+            logging.exception("Unexpected error occurred during price fetch.")
             return None
 
     logging.error(f"Max retries exceeded for {symbol.upper()} → {convert.upper()}")
     return None
 
 
-def track_prices(symbol: str, convert: str, interval: int) -> None:
+def track_prices(config: Config, symbol: str, convert: str, interval: int) -> None:
     """Track and log cryptocurrency prices at regular intervals."""
-    logging.info(f"Starting price tracker for {symbol.upper()} → {convert.upper()} every {interval}s.")
-
+    logging.info(f"Tracking {symbol.upper()} → {convert.upper()} every {interval}s.")
     try:
         while True:
-            price = fetch_price(symbol, convert)
+            price = fetch_price(config, symbol, convert)
             if price is not None:
                 message = f"{symbol.upper()} → {convert.upper()}: ${price:,.2f}"
                 logging.info(message)
@@ -102,34 +113,35 @@ def track_prices(symbol: str, convert: str, interval: int) -> None:
             time.sleep(interval)
 
     except KeyboardInterrupt:
-        logging.info("Tracker interrupted by user.")
-        print("\nTracker stopped.")
+        logging.info("Tracking stopped by user.")
+        print("\nTracking stopped.")
 
     except Exception:
-        logging.critical("Fatal error during price tracking", exc_info=True)
+        logging.critical("Critical error in price tracking loop.", exc_info=True)
         print("A critical error occurred. Exiting...")
 
 
-def parse_arguments() -> argparse.Namespace:
-    """Parse command-line arguments."""
+def parse_arguments(config: Config) -> argparse.Namespace:
+    """Parse CLI arguments."""
     parser = argparse.ArgumentParser(description="Real-time cryptocurrency price tracker.")
-    parser.add_argument("--symbol", default=CONFIG["default_symbol"], help="Cryptocurrency symbol (e.g., BTC).")
-    parser.add_argument("--convert", default=CONFIG["default_convert"], help="Conversion currency (e.g., USD).")
-    parser.add_argument("--interval", type=int, default=CONFIG["default_interval"], help="Update interval in seconds.")
+    parser.add_argument("--symbol", default=config.default_symbol, help="Cryptocurrency symbol (e.g., BTC).")
+    parser.add_argument("--convert", default=config.default_convert, help="Conversion currency (e.g., USD).")
+    parser.add_argument("--interval", type=int, default=config.default_interval, help="Update interval in seconds.")
     parser.add_argument("--log-level", default="INFO", help="Log level: DEBUG, INFO, WARNING, ERROR, CRITICAL.")
 
     args = parser.parse_args()
 
     if args.interval <= 0:
-        parser.error("Interval must be greater than 0.")
+        parser.error("Interval must be a positive number.")
 
     return args
 
 
 def main() -> None:
-    args = parse_arguments()
-    configure_logging(args.log_level)
-    track_prices(args.symbol, args.convert, args.interval)
+    config = load_config()
+    args = parse_arguments(config)
+    setup_logging(config.log_file, args.log_level)
+    track_prices(config, args.symbol, args.convert, args.interval)
 
 
 if __name__ == "__main__":
