@@ -2,11 +2,12 @@ import os
 import sys
 import time
 import random
+import signal
 import logging
 import argparse
 import requests
 from dataclasses import dataclass
-from typing import Optional, Dict, Any
+from typing import Optional
 from requests.exceptions import HTTPError, Timeout, RequestException
 
 
@@ -25,6 +26,7 @@ class Config:
 
 
 def load_config() -> Config:
+    """Load API key and return Config object."""
     api_key = os.getenv("CMC_API_KEY")
     if not api_key:
         logging.critical("CMC_API_KEY environment variable is not set.")
@@ -42,7 +44,7 @@ def setup_logging(log_file: str, level: str = "INFO") -> None:
 
     formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
 
-    file_handler = logging.FileHandler(log_file)
+    file_handler = logging.FileHandler(log_file, encoding="utf-8")
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
 
@@ -53,10 +55,11 @@ def setup_logging(log_file: str, level: str = "INFO") -> None:
 
 def exponential_backoff(attempt: int, factor: int, max_backoff: int) -> float:
     """Return exponential backoff time with jitter."""
-    return min(factor ** attempt + random.uniform(0, 1), max_backoff)
+    return min((factor ** attempt) + random.random(), max_backoff)
 
 
 def fetch_price(
+    session: requests.Session,
     config: Config,
     symbol: str,
     convert: str
@@ -68,7 +71,7 @@ def fetch_price(
     for attempt in range(1, config.max_retries + 1):
         try:
             logging.info(f"[Attempt {attempt}] Fetching {symbol.upper()} in {convert.upper()}...")
-            response = requests.get(
+            response = session.get(
                 config.api_url,
                 headers=headers,
                 params=params,
@@ -77,21 +80,32 @@ def fetch_price(
             response.raise_for_status()
 
             data = response.json()
-            price = data["data"][symbol.upper()]["quote"][convert.upper()]["price"]
+            price = (
+                data.get("data", {})
+                .get(symbol.upper(), {})
+                .get("quote", {})
+                .get(convert.upper(), {})
+                .get("price")
+            )
+
+            if price is None:
+                logging.error("Malformed response: price not found.")
+                return None
+
             logging.debug(f"API response: {data}")
             return float(price)
-
-        except KeyError as e:
-            logging.error(f"Malformed response (missing key): {e}")
-            return None
 
         except (HTTPError, Timeout, RequestException) as e:
             wait_time = exponential_backoff(attempt, config.backoff_factor, config.max_backoff)
             logging.warning(f"Request failed: {e}. Retrying in {wait_time:.2f}s...")
             time.sleep(wait_time)
 
+        except ValueError as e:
+            logging.error(f"JSON decode error: {e}")
+            return None
+
         except Exception:
-            logging.exception("Unexpected error occurred during price fetch.")
+            logging.exception("Unexpected error during price fetch.")
             return None
 
     logging.error(f"Max retries exceeded for {symbol.upper()} → {convert.upper()}")
@@ -101,9 +115,19 @@ def fetch_price(
 def track_prices(config: Config, symbol: str, convert: str, interval: int) -> None:
     """Track and log cryptocurrency prices at regular intervals."""
     logging.info(f"Tracking {symbol.upper()} → {convert.upper()} every {interval}s.")
-    try:
-        while True:
-            price = fetch_price(config, symbol, convert)
+
+    stop = False
+
+    def handle_sigterm(*_):
+        nonlocal stop
+        stop = True
+
+    signal.signal(signal.SIGINT, handle_sigterm)
+    signal.signal(signal.SIGTERM, handle_sigterm)
+
+    with requests.Session() as session:
+        while not stop:
+            price = fetch_price(session, config, symbol, convert)
             if price is not None:
                 message = f"{symbol.upper()} → {convert.upper()}: ${price:,.2f}"
                 logging.info(message)
@@ -112,13 +136,7 @@ def track_prices(config: Config, symbol: str, convert: str, interval: int) -> No
                 logging.warning(f"Failed to fetch price for {symbol.upper()} → {convert.upper()}")
             time.sleep(interval)
 
-    except KeyboardInterrupt:
-        logging.info("Tracking stopped by user.")
-        print("\nTracking stopped.")
-
-    except Exception:
-        logging.critical("Critical error in price tracking loop.", exc_info=True)
-        print("A critical error occurred. Exiting...")
+    logging.info("Tracking stopped.")
 
 
 def parse_arguments(config: Config) -> argparse.Namespace:
@@ -132,7 +150,7 @@ def parse_arguments(config: Config) -> argparse.Namespace:
     args = parser.parse_args()
 
     if args.interval <= 0:
-        parser.error("Interval must be a positive number.")
+        parser.error("Interval must be a positive integer.")
 
     return args
 
