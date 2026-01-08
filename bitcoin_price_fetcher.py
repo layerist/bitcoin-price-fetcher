@@ -2,11 +2,14 @@
 """
 CoinMarketCap cryptocurrency price tracker.
 
-Features:
-- Resilient HTTP session with retries
-- Exponential backoff with jitter
-- Colorized console logging + rotating file logs
-- Graceful shutdown on SIGINT / SIGTERM
+Improvements:
+- Clear separation of concerns (config / logging / networking / runtime)
+- Safer backoff math + centralized retry sleep
+- Persistent headers on session
+- Decimal for price precision
+- Drift-corrected scheduling
+- Cleaner error handling and logging
+- Type hints tightened
 """
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ import signal
 import logging
 import argparse
 from dataclasses import dataclass, field
+from decimal import Decimal
 from typing import Optional
 from logging.handlers import RotatingFileHandler
 
@@ -41,8 +45,8 @@ class Config:
     default_interval: int = 60
 
     max_retries: int = 5
-    backoff_factor: int = 2
-    max_backoff: int = 60
+    backoff_factor: float = 2.0
+    max_backoff: float = 60.0
     request_timeout: int = 10
 
     jitter_mode: str = "random"  # "random" | "full"
@@ -50,7 +54,7 @@ class Config:
     log_file: str = field(
         default_factory=lambda: f"crypto_price_{int(time.time())}.log"
     )
-    max_log_size: int = 5 * 1024 * 1024  # 5 MB
+    max_log_size: int = 5 * 1024 * 1024
     backup_count: int = 3
 
 
@@ -77,18 +81,16 @@ class ColorFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         color = self.COLORS.get(record.levelname, "")
-        message = super().format(record)
-        return f"{color}{message}{self.RESET}"
+        return f"{color}{super().format(record)}{self.RESET}"
 
 
 def setup_logging(config: Config, level: str) -> None:
-    root = logging.getLogger()
-    root.setLevel(getattr(logging, level.upper(), logging.INFO))
-    root.handlers.clear()
+    logger = logging.getLogger()
+    logger.setLevel(getattr(logging, level.upper(), logging.INFO))
+    logger.handlers.clear()
 
     fmt = "%(asctime)s | %(levelname)-8s | %(message)s"
 
-    # File logging
     file_handler = RotatingFileHandler(
         config.log_file,
         maxBytes=config.max_log_size,
@@ -97,45 +99,48 @@ def setup_logging(config: Config, level: str) -> None:
     )
     file_handler.setFormatter(logging.Formatter(fmt))
 
-    # Console logging
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(ColorFormatter(fmt))
 
-    root.addHandler(file_handler)
-    root.addHandler(console_handler)
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
 
 
 # ─────────────────────────────────────────────────────────────
 # Networking helpers
 # ─────────────────────────────────────────────────────────────
 
-def exponential_backoff(
+def compute_backoff(
     attempt: int,
-    factor: int,
-    max_backoff: int,
+    factor: float,
+    max_backoff: float,
     jitter_mode: str,
 ) -> float:
     base = min(factor ** attempt, max_backoff)
     if jitter_mode == "full":
-        return random.uniform(0, base)
+        return random.uniform(0.0, base)
     return min(base + random.random(), max_backoff)
 
 
 def create_session(config: Config) -> requests.Session:
     session = requests.Session()
+    session.headers.update({
+        "X-CMC_PRO_API_KEY": config.api_key,
+        "Accept": "application/json",
+        "User-Agent": "cmc-price-tracker/1.0",
+    })
 
     retries = Retry(
         total=config.max_retries,
-        backoff_factor=config.backoff_factor,
         status_forcelist=(429, 500, 502, 503, 504),
         allowed_methods=("GET",),
+        backoff_factor=0,  # handled manually
         raise_on_status=False,
     )
 
     adapter = HTTPAdapter(max_retries=retries)
     session.mount("https://", adapter)
     session.mount("http://", adapter)
-
     return session
 
 
@@ -148,9 +153,8 @@ def fetch_price(
     config: Config,
     symbol: str,
     convert: str,
-) -> Optional[float]:
+) -> Optional[Decimal]:
 
-    headers = {"X-CMC_PRO_API_KEY": config.api_key}
     params = {
         "symbol": symbol.upper(),
         "convert": convert.upper(),
@@ -158,67 +162,60 @@ def fetch_price(
 
     for attempt in range(1, config.max_retries + 1):
         try:
-            start = time.monotonic()
-            logging.debug(f"[Attempt {attempt}] Fetching {symbol.upper()}")
+            t0 = time.monotonic()
+            logging.debug("Fetching %s (%s)", symbol.upper(), attempt)
 
             response = session.get(
                 config.api_url,
-                headers=headers,
                 params=params,
                 timeout=config.request_timeout,
             )
             response.raise_for_status()
 
-            payload = response.json()
+            data = response.json()
             price = (
-                payload.get("data", {})
-                .get(symbol.upper(), {})
-                .get("quote", {})
-                .get(convert.upper(), {})
-                .get("price")
+                data["data"][symbol.upper()]
+                ["quote"][convert.upper()]
+                ["price"]
             )
-
-            if price is None:
-                logging.error("Malformed API response: price missing")
-                return None
 
             logging.debug(
-                f"Request completed in {time.monotonic() - start:.2f}s"
+                "Request finished in %.2fs", time.monotonic() - t0
             )
-            return float(price)
+            return Decimal(str(price))
 
         except HTTPError as exc:
-            status = response.status_code if "response" in locals() else None
+            status = getattr(exc.response, "status_code", None)
             if status == 429:
-                logging.warning("Rate limit hit (429)")
-            wait = exponential_backoff(
+                logging.warning("Rate limit exceeded (429)")
+            wait = compute_backoff(
                 attempt,
                 config.backoff_factor,
                 config.max_backoff,
                 config.jitter_mode,
             )
-            logging.warning(f"{exc} → retry in {wait:.1f}s")
+            logging.warning("%s → retry in %.1fs", exc, wait)
             time.sleep(wait)
 
         except (Timeout, RequestException) as exc:
-            wait = exponential_backoff(
+            wait = compute_backoff(
                 attempt,
                 config.backoff_factor,
                 config.max_backoff,
                 config.jitter_mode,
             )
-            logging.warning(f"Network error: {exc} → retry in {wait:.1f}s")
+            logging.warning("Network error: %s → retry in %.1fs", exc, wait)
             time.sleep(wait)
 
-        except ValueError:
-            logging.error("Invalid JSON response from API")
+        except (KeyError, ValueError):
+            logging.error("Malformed API response")
             return None
 
         except Exception:
             logging.exception("Unexpected error during fetch")
             return None
 
-    logging.error(f"❌ Max retries exceeded for {symbol.upper()}")
+    logging.error("Max retries exceeded for %s", symbol.upper())
     return None
 
 
@@ -234,16 +231,20 @@ def track_prices(
 ) -> None:
 
     logging.info(
-        f"🚀 Tracking {symbol.upper()} → {convert.upper()} every {interval}s"
+        "Tracking %s → %s every %ds",
+        symbol.upper(),
+        convert.upper(),
+        interval,
     )
 
     session = create_session(config)
     running = True
+    next_tick = time.monotonic()
 
     def stop_handler(*_: object) -> None:
         nonlocal running
         running = False
-        logging.info("🛑 Shutdown signal received")
+        logging.info("Shutdown signal received")
 
     signal.signal(signal.SIGINT, stop_handler)
     signal.signal(signal.SIGTERM, stop_handler)
@@ -253,13 +254,18 @@ def track_prices(
             price = fetch_price(session, config, symbol, convert)
             if price is not None:
                 logging.info(
-                    f"{symbol.upper()} → {convert.upper()}: ${price:,.2f}"
+                    "%s → %s: $%s",
+                    symbol.upper(),
+                    convert.upper(),
+                    f"{price:,.2f}",
                 )
             else:
-                logging.warning("Failed to retrieve price")
+                logging.warning("Price fetch failed")
 
-            sleep_time = max(1, interval + random.uniform(-0.5, 0.5))
-            time.sleep(sleep_time)
+            next_tick += interval
+            sleep_for = max(1.0, next_tick - time.monotonic())
+            sleep_for += random.uniform(-0.5, 0.5)
+            time.sleep(max(1.0, sleep_for))
 
     finally:
         session.close()
@@ -274,7 +280,6 @@ def parse_arguments(config: Config) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Cryptocurrency price tracker (CoinMarketCap API)"
     )
-    parser.add_argument("command", nargs="?", default="track", choices=("track",))
     parser.add_argument("--symbol", default=config.default_symbol)
     parser.add_argument("--convert", default=config.default_convert)
     parser.add_argument("--interval", type=int, default=config.default_interval)
@@ -292,8 +297,7 @@ def main() -> None:
     args = parse_arguments(config)
     setup_logging(config, args.log_level)
 
-    if args.command == "track":
-        track_prices(config, args.symbol, args.convert, args.interval)
+    track_prices(config, args.symbol, args.convert, args.interval)
 
 
 if __name__ == "__main__":
