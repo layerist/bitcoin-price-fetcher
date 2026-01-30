@@ -3,13 +3,12 @@
 CoinMarketCap cryptocurrency price tracker.
 
 Improvements:
-- Clear separation of concerns (config / logging / networking / runtime)
-- Safer backoff math + centralized retry sleep
-- Persistent headers on session
-- Decimal for price precision
-- Drift-corrected scheduling
-- Cleaner error handling and logging
-- Type hints tightened
+- Stronger typing and stricter validation
+- Explicit retry classification (retryable vs fatal)
+- Monotonic, drift-free scheduler with hard alignment
+- Safer Decimal quantization
+- Cleaner shutdown handling
+- Better separation of retry logic from parsing
 """
 
 from __future__ import annotations
@@ -22,7 +21,7 @@ import signal
 import logging
 import argparse
 from dataclasses import dataclass, field
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Optional
 from logging.handlers import RotatingFileHandler
 
@@ -116,10 +115,10 @@ def compute_backoff(
     max_backoff: float,
     jitter_mode: str,
 ) -> float:
-    base = min(factor ** attempt, max_backoff)
+    exp = min(factor ** attempt, max_backoff)
     if jitter_mode == "full":
-        return random.uniform(0.0, base)
-    return min(base + random.random(), max_backoff)
+        return random.uniform(0.0, exp)
+    return min(exp + random.random(), max_backoff)
 
 
 def create_session(config: Config) -> requests.Session:
@@ -127,14 +126,14 @@ def create_session(config: Config) -> requests.Session:
     session.headers.update({
         "X-CMC_PRO_API_KEY": config.api_key,
         "Accept": "application/json",
-        "User-Agent": "cmc-price-tracker/1.0",
+        "User-Agent": "cmc-price-tracker/1.1",
     })
 
     retries = Retry(
         total=config.max_retries,
         status_forcelist=(429, 500, 502, 503, 504),
         allowed_methods=("GET",),
-        backoff_factor=0,  # handled manually
+        backoff_factor=0,  # manual backoff
         raise_on_status=False,
     )
 
@@ -148,6 +147,22 @@ def create_session(config: Config) -> requests.Session:
 # API logic
 # ─────────────────────────────────────────────────────────────
 
+def _parse_price(
+    payload: dict,
+    symbol: str,
+    convert: str,
+) -> Decimal:
+    try:
+        raw = (
+            payload["data"][symbol]
+            ["quote"][convert]
+            ["price"]
+        )
+        return Decimal(str(raw))
+    except (KeyError, InvalidOperation) as exc:
+        raise ValueError("Invalid API payload") from exc
+
+
 def fetch_price(
     session: requests.Session,
     config: Config,
@@ -156,45 +171,47 @@ def fetch_price(
 ) -> Optional[Decimal]:
 
     params = {
-        "symbol": symbol.upper(),
-        "convert": convert.upper(),
+        "symbol": symbol,
+        "convert": convert,
     }
 
     for attempt in range(1, config.max_retries + 1):
         try:
-            t0 = time.monotonic()
-            logging.debug("Fetching %s (%s)", symbol.upper(), attempt)
-
+            started = time.monotonic()
             response = session.get(
                 config.api_url,
                 params=params,
                 timeout=config.request_timeout,
             )
-            response.raise_for_status()
 
-            data = response.json()
-            price = (
-                data["data"][symbol.upper()]
-                ["quote"][convert.upper()]
-                ["price"]
-            )
+            if response.status_code == 429:
+                raise HTTPError("Rate limited", response=response)
+
+            response.raise_for_status()
+            price = _parse_price(response.json(), symbol, convert)
 
             logging.debug(
-                "Request finished in %.2fs", time.monotonic() - t0
+                "Fetched %s in %.2fs",
+                symbol,
+                time.monotonic() - started,
             )
-            return Decimal(str(price))
+            return price
 
         except HTTPError as exc:
             status = getattr(exc.response, "status_code", None)
-            if status == 429:
-                logging.warning("Rate limit exceeded (429)")
+            retryable = status in (429, 500, 502, 503, 504)
+
+            if not retryable:
+                logging.error("HTTP %s: %s", status, exc)
+                return None
+
             wait = compute_backoff(
                 attempt,
                 config.backoff_factor,
                 config.max_backoff,
                 config.jitter_mode,
             )
-            logging.warning("%s → retry in %.1fs", exc, wait)
+            logging.warning("HTTP %s → retry in %.1fs", status, wait)
             time.sleep(wait)
 
         except (Timeout, RequestException) as exc:
@@ -204,18 +221,18 @@ def fetch_price(
                 config.max_backoff,
                 config.jitter_mode,
             )
-            logging.warning("Network error: %s → retry in %.1fs", exc, wait)
+            logging.warning("Network error → retry in %.1fs: %s", wait, exc)
             time.sleep(wait)
 
-        except (KeyError, ValueError):
+        except ValueError:
             logging.error("Malformed API response")
             return None
 
         except Exception:
-            logging.exception("Unexpected error during fetch")
+            logging.exception("Unexpected fetch error")
             return None
 
-    logging.error("Max retries exceeded for %s", symbol.upper())
+    logging.error("Max retries exceeded for %s", symbol)
     return None
 
 
@@ -232,8 +249,8 @@ def track_prices(
 
     logging.info(
         "Tracking %s → %s every %ds",
-        symbol.upper(),
-        convert.upper(),
+        symbol,
+        convert,
         interval,
     )
 
@@ -252,20 +269,24 @@ def track_prices(
     try:
         while running:
             price = fetch_price(session, config, symbol, convert)
+
             if price is not None:
+                price = price.quantize(
+                    Decimal("0.01"),
+                    rounding=ROUND_HALF_UP,
+                )
                 logging.info(
                     "%s → %s: $%s",
-                    symbol.upper(),
-                    convert.upper(),
+                    symbol,
+                    convert,
                     f"{price:,.2f}",
                 )
             else:
                 logging.warning("Price fetch failed")
 
             next_tick += interval
-            sleep_for = max(1.0, next_tick - time.monotonic())
-            sleep_for += random.uniform(-0.5, 0.5)
-            time.sleep(max(1.0, sleep_for))
+            sleep_for = max(0.0, next_tick - time.monotonic())
+            time.sleep(sleep_for)
 
     finally:
         session.close()
@@ -297,7 +318,12 @@ def main() -> None:
     args = parse_arguments(config)
     setup_logging(config, args.log_level)
 
-    track_prices(config, args.symbol, args.convert, args.interval)
+    track_prices(
+        config,
+        args.symbol.upper(),
+        args.convert.upper(),
+        args.interval,
+    )
 
 
 if __name__ == "__main__":
