@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """
-CoinMarketCap Cryptocurrency Tracker (v6)
+CoinMarketCap Cryptocurrency Tracker (v7 Production Grade)
 
 Improvements:
+- Persistent local cache
+- Configurable multi-symbol support
+- Better JSON parsing safety
+- Thread-safe circuit breaker
+- Monotonic timing
 - Production-grade retry system
 - Adaptive polling interval
 - Proper HALF_OPEN circuit breaker
@@ -282,7 +287,7 @@ def create_session(config: Config):
         "X-CMC_PRO_API_KEY":
             config.api_key,
         "User-Agent":
-            "cmc-tracker/6.0",
+            "cmc-tracker/7.0",
     })
 
     adapter = HTTPAdapter(
