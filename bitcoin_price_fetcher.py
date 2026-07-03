@@ -1,29 +1,25 @@
 #!/usr/bin/env python3
 """
-CoinMarketCap Cryptocurrency Tracker (v7 Production Grade)
+CoinMarketCap Cryptocurrency Tracker v8
 
-Improvements:
-- Persistent local cache
-- Configurable multi-symbol support
-- Better JSON parsing safety
-- Thread-safe circuit breaker
-- Monotonic timing
-- Production-grade retry system
-- Adaptive polling interval
-- Proper HALF_OPEN circuit breaker
-- Session auto-recreation
-- Better rate-limit awareness
-- Thread-safe metrics
-- Graceful shutdown
-- Rolling latency metrics
-- Price delta tracking
-- Health logging
-- Non-blocking retry waits
+Features:
+- One API request for multiple symbols
+- Atomic persistent JSON cache with stale-cache reporting
+- Thread-safe circuit breaker with a single HALF_OPEN probe
+- Monotonic clocks for durations and recovery windows
+- Retry-After support (seconds and HTTP date)
+- Retry only for transient failures; permanent API errors fail fast
+- Adaptive polling with gradual recovery to the configured interval
+- Session recreation after transport failures or request-count threshold
+- Rolling success/latency metrics with p95
+- Graceful shutdown and interruptible waits
+- Optional proxy, cache path, log path, and CLI overrides
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import random
@@ -32,746 +28,614 @@ import sys
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass, field
-from decimal import Decimal, ROUND_HALF_UP
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from email.utils import parsedate_to_datetime
 from enum import Enum
 from logging.handlers import RotatingFileHandler
-from typing import Optional
+from pathlib import Path
+from statistics import fmean
+from typing import Any, Mapping, Sequence
 
 import requests
+from requests import Response, Session
 from requests.adapters import HTTPAdapter
-from requests.exceptions import (
-    ConnectionError,
-    HTTPError,
-    RequestException,
-    Timeout,
-)
+from requests.exceptions import ConnectionError as RequestsConnectionError
+from requests.exceptions import RequestException, Timeout
 
-# ============================================================
-# CONFIG
-# ============================================================
+
+RETRYABLE_STATUS = {408, 425, 429, 500, 502, 503, 504}
+DEFAULT_CACHE_FILE = "cmc_price_cache.json"
+
 
 @dataclass(slots=True)
 class Config:
     api_key: str
-
-    api_url: str = (
-        "https://pro-api.coinmarketcap.com"
-        "/v1/cryptocurrency/quotes/latest"
-    )
-
-    default_symbol: str = "BTC"
+    api_url: str = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest"
+    default_symbols: tuple[str, ...] = ("BTC",)
     default_convert: str = "USD"
-
-    default_interval: int = 60
-    min_interval: int = 5
-    max_interval: int = 3600
-    interval_step: int = 5
-
-    request_timeout: int = 15
-
+    default_interval: float = 60.0
+    min_interval: float = 5.0
+    max_interval: float = 3600.0
+    interval_step: float = 5.0
+    request_timeout: tuple[float, float] = (5.0, 15.0)
     max_retries: int = 5
     backoff_factor: float = 1.5
-    max_backoff: float = 60
-
+    max_backoff: float = 60.0
     failure_threshold: int = 5
-    recovery_time: int = 120
-
+    recovery_time: float = 120.0
     session_refresh_every: int = 500
     metrics_window: int = 100
-
     adaptive_interval: bool = True
     health_log_every: int = 10
-
-    log_file: str = field(
-        default_factory=lambda:
-        f"crypto_price_{int(time.time())}.log"
-    )
-
+    cache_file: Path = Path(DEFAULT_CACHE_FILE)
+    cache_max_age: float = 86400.0
+    log_file: Path = field(default_factory=lambda: Path("cmc_tracker.log"))
     max_log_size: int = 10 * 1024 * 1024
     backup_count: int = 5
-
     jitter_mode: str = "full"
+    proxy_url: str | None = None
+
+
+def env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def load_config() -> Config:
-    api_key = os.getenv("CMC_API_KEY")
+    api_key = os.getenv("CMC_API_KEY", "").strip()
 
-    if not api_key:
-        print(
-            "Missing environment variable: CMC_API_KEY",
-            file=sys.stderr,
-        )
-        sys.exit(2)
-
-    return Config(api_key=api_key)
-
-
-# ============================================================
-# LOGGING
-# ============================================================
-
-class ContextAdapter(logging.LoggerAdapter):
-    def process(self, msg, kwargs):
-        pair = self.extra.get("pair", "")
-        return f"[{pair}] {msg}", kwargs
+    proxy = os.getenv("CMC_PROXY_URL", "").strip() or None
+    return Config(
+        api_key=api_key,
+        cache_file=Path(os.getenv("CMC_CACHE_FILE", DEFAULT_CACHE_FILE)),
+        log_file=Path(os.getenv("CMC_LOG_FILE", "cmc_tracker.log")),
+        adaptive_interval=env_bool("CMC_ADAPTIVE_INTERVAL", True),
+        proxy_url=proxy,
+    )
 
 
 class ColorFormatter(logging.Formatter):
     COLORS = {
-        "DEBUG": "\033[90m",
-        "INFO": "\033[96m",
-        "WARNING": "\033[93m",
-        "ERROR": "\033[91m",
-        "CRITICAL": "\033[95m",
+        logging.DEBUG: "\033[90m",
+        logging.INFO: "\033[96m",
+        logging.WARNING: "\033[93m",
+        logging.ERROR: "\033[91m",
+        logging.CRITICAL: "\033[95m",
     }
-
     RESET = "\033[0m"
 
-    def format(self, record):
-        color = self.COLORS.get(record.levelname, "")
+    def format(self, record: logging.LogRecord) -> str:
         message = super().format(record)
-        return f"{color}{message}{self.RESET}"
+        if not sys.stdout.isatty() or os.getenv("NO_COLOR"):
+            return message
+        return f"{self.COLORS.get(record.levelno, '')}{message}{self.RESET}"
 
 
-def setup_logging(config: Config, level: str):
-    logger = logging.getLogger("tracker")
-    logger.setLevel(
-        getattr(logging, level.upper(), logging.INFO)
-    )
+def setup_logging(config: Config, level: str) -> logging.Logger:
+    logger = logging.getLogger("cmc_tracker")
+    logger.setLevel(getattr(logging, level.upper(), logging.INFO))
+    logger.propagate = False
     logger.handlers.clear()
 
-    fmt = (
-        "%(asctime)s | "
-        "%(levelname)-8s | "
-        "%(message)s"
-    )
+    fmt = "%(asctime)s | %(levelname)-8s | %(message)s"
+    file_formatter = logging.Formatter(fmt)
+    console_formatter = ColorFormatter(fmt)
 
-    formatter = logging.Formatter(fmt)
-
+    config.log_file.parent.mkdir(parents=True, exist_ok=True)
     file_handler = RotatingFileHandler(
         config.log_file,
         maxBytes=config.max_log_size,
         backupCount=config.backup_count,
         encoding="utf-8",
     )
-    file_handler.setFormatter(formatter)
+    file_handler.setFormatter(file_formatter)
 
     console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setFormatter(
-        ColorFormatter(fmt)
-    )
+    console_handler.setFormatter(console_formatter)
 
     logger.addHandler(file_handler)
     logger.addHandler(console_handler)
-
     return logger
 
 
-# ============================================================
-# METRICS
-# ============================================================
+@dataclass(frozen=True, slots=True)
+class MetricsSnapshot:
+    ok: int
+    failed: int
+    success_rate: float
+    avg_latency: float
+    p95_latency: float
+
 
 class Metrics:
-    def __init__(self, window=100):
-        self.lock = threading.Lock()
+    def __init__(self, window: int) -> None:
+        self._lock = threading.Lock()
+        self._ok = 0
+        self._failed = 0
+        self._latencies: deque[float] = deque(maxlen=max(1, window))
 
-        self.success = 0
-        self.fail = 0
+    def record(self, success: bool, latency: float) -> None:
+        with self._lock:
+            self._ok += int(success)
+            self._failed += int(not success)
+            self._latencies.append(max(0.0, latency))
 
-        self.latencies = deque(maxlen=window)
-
-    def record(
-        self,
-        success: bool,
-        latency: float
-    ):
-        with self.lock:
-            if success:
-                self.success += 1
-            else:
-                self.fail += 1
-
-            self.latencies.append(latency)
+    def snapshot(self) -> MetricsSnapshot:
+        with self._lock:
+            values = sorted(self._latencies)
+            total = self._ok + self._failed
+            p95_index = max(0, min(len(values) - 1, int(len(values) * 0.95) - 1))
+            return MetricsSnapshot(
+                ok=self._ok,
+                failed=self._failed,
+                success_rate=(self._ok / total * 100.0) if total else 0.0,
+                avg_latency=fmean(values) if values else 0.0,
+                p95_latency=values[p95_index] if values else 0.0,
+            )
 
     def summary(self) -> str:
-        with self.lock:
-            total = self.success + self.fail
-
-            success_rate = (
-                (self.success / total) * 100
-                if total else 0
-            )
-
-            avg_latency = (
-                sum(self.latencies)
-                / len(self.latencies)
-                if self.latencies else 0
-            )
-
-            return (
-                f"success={success_rate:.1f}% "
-                f"avg_latency={avg_latency:.2f}s "
-                f"ok={self.success} "
-                f"fail={self.fail}"
-            )
+        snap = self.snapshot()
+        return (
+            f"success={snap.success_rate:.1f}% avg={snap.avg_latency:.2f}s "
+            f"p95={snap.p95_latency:.2f}s ok={snap.ok} fail={snap.failed}"
+        )
 
 
-# ============================================================
-# CIRCUIT BREAKER
-# ============================================================
-
-class CircuitState(Enum):
-    CLOSED = 1
-    OPEN = 2
-    HALF_OPEN = 3
+class CircuitState(str, Enum):
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
 
 
 class CircuitBreaker:
-    def __init__(
-        self,
-        threshold: int,
-        recovery_time: int
-    ):
-        self.threshold = threshold
-        self.recovery_time = recovery_time
+    def __init__(self, threshold: int, recovery_time: float) -> None:
+        if threshold < 1 or recovery_time <= 0:
+            raise ValueError("Invalid circuit breaker configuration")
+        self._threshold = threshold
+        self._recovery_time = recovery_time
+        self._lock = threading.Lock()
+        self._failures = 0
+        self._state = CircuitState.CLOSED
+        self._opened_at = 0.0
+        self._probe_in_flight = False
 
-        self.failures = 0
-        self.state = CircuitState.CLOSED
-        self.opened_at = 0.0
+    def acquire_permission(self) -> tuple[bool, float]:
+        now = time.monotonic()
+        with self._lock:
+            if self._state is CircuitState.CLOSED:
+                return True, 0.0
 
-    def allow_request(self) -> bool:
-        if self.state == CircuitState.CLOSED:
-            return True
+            if self._state is CircuitState.OPEN:
+                remaining = self._recovery_time - (now - self._opened_at)
+                if remaining > 0:
+                    return False, remaining
+                self._state = CircuitState.HALF_OPEN
+                self._probe_in_flight = False
 
-        if self.state == CircuitState.OPEN:
-            if (
-                time.time() - self.opened_at
-                >= self.recovery_time
-            ):
-                self.state = (
-                    CircuitState.HALF_OPEN
-                )
-                return True
+            if self._probe_in_flight:
+                return False, self._recovery_time
 
-            return False
+            self._probe_in_flight = True
+            return True, 0.0
 
-        return True
+    def record_success(self) -> None:
+        with self._lock:
+            self._failures = 0
+            self._state = CircuitState.CLOSED
+            self._probe_in_flight = False
 
-    def success(self):
-        self.failures = 0
-        self.state = CircuitState.CLOSED
+    def record_failure(self) -> None:
+        now = time.monotonic()
+        with self._lock:
+            self._probe_in_flight = False
+            self._failures += 1
+            if self._state is CircuitState.HALF_OPEN or self._failures >= self._threshold:
+                self._state = CircuitState.OPEN
+                self._opened_at = now
 
-    def failure(self):
-        self.failures += 1
-
-        if self.failures >= self.threshold:
-            self.state = CircuitState.OPEN
-            self.opened_at = time.time()
-
-
-# ============================================================
-# SESSION
-# ============================================================
-
-RETRYABLE_STATUS = {
-    429, 500, 502, 503, 504
-}
+    def snapshot(self) -> tuple[CircuitState, int]:
+        with self._lock:
+            return self._state, self._failures
 
 
-def create_session(config: Config):
+@dataclass(frozen=True, slots=True)
+class PricePoint:
+    symbol: str
+    convert: str
+    price: Decimal
+    fetched_at: str
+
+
+class PriceCache:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._lock = threading.Lock()
+
+    def load(self) -> dict[str, PricePoint]:
+        with self._lock:
+            try:
+                raw = json.loads(self.path.read_text(encoding="utf-8"))
+                result: dict[str, PricePoint] = {}
+                for key, item in raw.get("prices", {}).items():
+                    result[key] = PricePoint(
+                        symbol=str(item["symbol"]),
+                        convert=str(item["convert"]),
+                        price=Decimal(str(item["price"])),
+                        fetched_at=str(item["fetched_at"]),
+                    )
+                return result
+            except FileNotFoundError:
+                return {}
+            except (OSError, ValueError, KeyError, TypeError, InvalidOperation):
+                return {}
+
+    def save(self, prices: Mapping[str, PricePoint]) -> None:
+        payload = {
+            "version": 1,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "prices": {
+                key: {**asdict(point), "price": str(point.price)}
+                for key, point in prices.items()
+            },
+        }
+        encoded = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        with self._lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(encoded, encoding="utf-8")
+            os.replace(tmp, self.path)
+
+
+class RetryableError(RuntimeError):
+    def __init__(self, message: str, retry_after: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+class PermanentAPIError(RuntimeError):
+    pass
+
+
+def create_session(config: Config) -> Session:
     session = requests.Session()
-
-    session.headers.update({
-        "Accept": "application/json",
-        "X-CMC_PRO_API_KEY":
-            config.api_key,
-        "User-Agent":
-            "cmc-tracker/7.0",
-    })
-
-    adapter = HTTPAdapter(
-        pool_connections=10,
-        pool_maxsize=10,
-        max_retries=0,
+    session.headers.update(
+        {
+            "Accept": "application/json",
+            "Accept-Encoding": "gzip, deflate",
+            "X-CMC_PRO_API_KEY": config.api_key,
+            "User-Agent": "cmc-tracker/8.0",
+        }
     )
-
-    session.mount(
-        "https://",
-        adapter
-    )
-
+    adapter = HTTPAdapter(pool_connections=4, pool_maxsize=4, max_retries=0)
+    session.mount("https://", adapter)
+    if config.proxy_url:
+        session.proxies.update({"http": config.proxy_url, "https": config.proxy_url})
     return session
 
 
-# ============================================================
-# HELPERS
-# ============================================================
-
-def compute_backoff(
-    attempt: int,
-    config: Config
-):
-    base = min(
-        config.backoff_factor
-        * (2 ** (attempt - 1)),
-        config.max_backoff,
-    )
-
+def compute_backoff(attempt: int, config: Config) -> float:
+    base = min(config.backoff_factor * (2 ** max(0, attempt - 1)), config.max_backoff)
     if config.jitter_mode == "full":
-        return random.uniform(0, base)
-
+        return random.uniform(0.0, base)
     if config.jitter_mode == "equal":
-        return (
-            base / 2
-            + random.uniform(0, base / 2)
-        )
-
+        return base / 2.0 + random.uniform(0.0, base / 2.0)
     return base
 
 
-def parse_price(
-    payload: dict,
-    symbol: str,
-    convert: str,
-) -> Decimal:
+def parse_retry_after(value: str | None) -> float | None:
+    if not value:
+        return None
     try:
-        return Decimal(
-            str(
-                payload["data"]
-                [symbol]
-                ["quote"]
-                [convert]
-                ["price"]
-            )
-        )
-    except Exception as exc:
-        raise ValueError(
-            "Invalid API payload"
-        ) from exc
-
-
-# ============================================================
-# FETCH
-# ============================================================
-
-def fetch_price(
-    session,
-    config,
-    symbol,
-    convert,
-    breaker,
-    logger,
-    metrics,
-    stop_event,
-):
-    if not breaker.allow_request():
-        logger.warning(
-            "Circuit breaker OPEN"
-        )
-        return None, None
-
-    params = {
-        "symbol": symbol,
-        "convert": convert,
-    }
-
-    for attempt in range(
-        1,
-        config.max_retries + 1
-    ):
-        start = time.perf_counter()
-
+        return max(0.0, float(value.strip()))
+    except ValueError:
         try:
-            response = session.get(
-                config.api_url,
-                params=params,
-                timeout=config.request_timeout,
-            )
+            when = parsedate_to_datetime(value)
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+            return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+        except (TypeError, ValueError, OverflowError):
+            return None
 
-            latency = (
-                time.perf_counter()
-                - start
-            )
 
-            status = response.status_code
+def parse_prices(payload: Mapping[str, Any], symbols: Sequence[str], convert: str) -> dict[str, Decimal]:
+    status = payload.get("status")
+    if not isinstance(status, Mapping):
+        raise PermanentAPIError("API response has no valid status object")
 
-            if status == 429:
-                metrics.record(
-                    False,
-                    latency,
-                )
+    error_code = status.get("error_code", 0)
+    if error_code not in (0, "0", None):
+        raise PermanentAPIError(str(status.get("error_message") or f"CMC error {error_code}"))
 
-                breaker.failure()
+    data = payload.get("data")
+    if not isinstance(data, Mapping):
+        raise PermanentAPIError("API response has no valid data object")
 
-                retry_after = int(
-                    response.headers.get(
-                        "Retry-After",
-                        30
-                    )
-                )
+    prices: dict[str, Decimal] = {}
+    missing: list[str] = []
+    for symbol in symbols:
+        try:
+            raw_price = data[symbol]["quote"][convert]["price"]
+            value = Decimal(str(raw_price))
+            if not value.is_finite() or value < 0:
+                raise InvalidOperation
+            prices[symbol] = value
+        except (KeyError, TypeError, InvalidOperation, ValueError):
+            missing.append(symbol)
 
-                logger.warning(
-                    "Rate limit hit "
-                    f"(retry={retry_after}s)"
-                )
+    if missing:
+        raise PermanentAPIError(f"Missing or invalid price data for: {', '.join(missing)}")
+    return prices
 
-                return None, retry_after
 
-            if status in RETRYABLE_STATUS:
-                raise HTTPError(
-                    f"HTTP {status}"
-                )
+def decode_response(response: Response, symbols: Sequence[str], convert: str) -> dict[str, Decimal]:
+    retry_after = parse_retry_after(response.headers.get("Retry-After"))
+    if response.status_code in RETRYABLE_STATUS:
+        raise RetryableError(f"HTTP {response.status_code}", retry_after)
+    if not 200 <= response.status_code < 300:
+        detail = response.text[:300].replace("\n", " ")
+        raise PermanentAPIError(f"HTTP {response.status_code}: {detail}")
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise RetryableError("Invalid JSON response") from exc
+    if not isinstance(payload, Mapping):
+        raise PermanentAPIError("Unexpected JSON root type")
+    return parse_prices(payload, symbols, convert)
 
-            payload = response.json()
 
-            error_code = (
-                payload.get("status", {})
-                .get("error_code", 0)
-            )
+def fetch_prices(
+    session: Session,
+    config: Config,
+    symbols: Sequence[str],
+    convert: str,
+    breaker: CircuitBreaker,
+    metrics: Metrics,
+    logger: logging.Logger,
+    stop_event: threading.Event,
+) -> tuple[dict[str, Decimal] | None, float | None, bool]:
+    allowed, retry_in = breaker.acquire_permission()
+    if not allowed:
+        logger.warning("Circuit breaker OPEN; next probe in %.1fs", retry_in)
+        return None, retry_in, False
 
-            if error_code != 0:
-                raise ValueError(
-                    payload
-                    .get("status", {})
-                    .get(
-                        "error_message",
-                        "API error"
-                    )
-                )
+    params = {"symbol": ",".join(symbols), "convert": convert}
+    recreate_session = False
 
-            price = parse_price(
-                payload,
-                symbol,
-                convert,
-            )
-
-            remaining = (
-                response.headers.get(
-                    "X-RateLimit-Remaining"
-                )
-            )
-
-            breaker.success()
-
-            metrics.record(
-                True,
-                latency
-            )
-
-            if remaining:
-                logger.debug(
-                    f"Rate limit "
-                    f"remaining={remaining}"
-                )
-
-            return price, None
-
-        except (
-            Timeout,
-            ConnectionError,
-            HTTPError,
-            RequestException,
-        ) as exc:
-
-            latency = (
-                time.perf_counter()
-                - start
-            )
-
-            metrics.record(
-                False,
+    for attempt in range(1, config.max_retries + 1):
+        started = time.perf_counter()
+        try:
+            response = session.get(config.api_url, params=params, timeout=config.request_timeout)
+            latency = time.perf_counter() - started
+            prices = decode_response(response, symbols, convert)
+            metrics.record(True, latency)
+            breaker.record_success()
+            logger.debug(
+                "HTTP %s in %.3fs | remaining=%s",
+                response.status_code,
                 latency,
+                response.headers.get("X-RateLimit-Remaining", "?"),
             )
+            return prices, None, recreate_session
 
-            breaker.failure()
+        except PermanentAPIError as exc:
+            latency = time.perf_counter() - started
+            metrics.record(False, latency)
+            breaker.record_failure()
+            logger.error("Permanent API error: %s", exc)
+            return None, None, recreate_session
 
-            wait = compute_backoff(
-                attempt,
-                config,
-            )
+        except RetryableError as exc:
+            latency = time.perf_counter() - started
+            metrics.record(False, latency)
+            breaker.record_failure()
+            wait = exc.retry_after if exc.retry_after is not None else compute_backoff(attempt, config)
+            logger.warning("Attempt %d/%d failed: %s; retry in %.2fs", attempt, config.max_retries, exc, wait)
 
-            logger.warning(
-                f"Attempt={attempt} "
-                f"wait={wait:.2f}s "
-                f"error={exc}"
-            )
+        except (Timeout, RequestsConnectionError, RequestException) as exc:
+            latency = time.perf_counter() - started
+            metrics.record(False, latency)
+            breaker.record_failure()
+            recreate_session = True
+            wait = compute_backoff(attempt, config)
+            logger.warning("Attempt %d/%d transport error: %s; retry in %.2fs", attempt, config.max_retries, exc, wait)
 
-            if stop_event.wait(wait):
-                return None, None
+        if attempt < config.max_retries and stop_event.wait(wait):
+            return None, None, recreate_session
 
-        except Exception as exc:
-            breaker.failure()
-
-            logger.exception(
-                f"Fatal error: {exc}"
-            )
-
-            return None, None
-
-    return None, None
+    return None, None, recreate_session
 
 
-# ============================================================
-# TRACKER LOOP
-# ============================================================
+def cache_key(symbol: str, convert: str) -> str:
+    return f"{symbol}/{convert}"
 
-def track_prices(
-    config,
-    symbol,
-    convert,
-    interval,
-    logger,
-):
-    logger = ContextAdapter(
-        logger,
-        {"pair":
-         f"{symbol}/{convert}"}
-    )
 
-    stop_event = threading.Event()
+def parse_iso_age(timestamp: str) -> float | None:
+    try:
+        parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return max(0.0, (datetime.now(timezone.utc) - parsed).total_seconds())
+    except (TypeError, ValueError, OverflowError):
+        return None
 
-    def stop_handler(*_):
-        logger.info(
-            "Shutdown requested..."
-        )
+
+def format_price(price: Decimal) -> str:
+    if price >= Decimal("1"):
+        quant = Decimal("0.01")
+    elif price >= Decimal("0.01"):
+        quant = Decimal("0.000001")
+    else:
+        quant = Decimal("0.0000000001")
+    return f"{price.quantize(quant, rounding=ROUND_HALF_UP):,f}"
+
+
+def install_signal_handlers(stop_event: threading.Event, logger: logging.Logger) -> None:
+    def handler(signum: int, _frame: object) -> None:
+        logger.info("Shutdown requested by signal %s", signum)
         stop_event.set()
 
-    signal.signal(
-        signal.SIGINT,
-        stop_handler
-    )
-    signal.signal(
-        signal.SIGTERM,
-        stop_handler
-    )
+    signal.signal(signal.SIGINT, handler)
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, handler)
+
+
+def track_prices(
+    config: Config,
+    symbols: Sequence[str],
+    convert: str,
+    target_interval: float,
+    logger: logging.Logger,
+) -> None:
+    stop_event = threading.Event()
+    install_signal_handlers(stop_event, logger)
+
+    cache = PriceCache(config.cache_file)
+    cached = cache.load()
+    last_prices: dict[str, Decimal] = {
+        symbol: cached[cache_key(symbol, convert)].price
+        for symbol in symbols
+        if cache_key(symbol, convert) in cached
+    }
 
     session = create_session(config)
-
-    breaker = CircuitBreaker(
-        config.failure_threshold,
-        config.recovery_time,
-    )
-
-    metrics = Metrics(
-        config.metrics_window
-    )
-
-    request_count = 0
+    breaker = CircuitBreaker(config.failure_threshold, config.recovery_time)
+    metrics = Metrics(config.metrics_window)
+    current_interval = target_interval
     cycle = 0
+    session_requests = 0
 
-    last_price = None
+    logger.info("Tracking %s in %s every %.1fs", ",".join(symbols), convert, target_interval)
 
-    while not stop_event.is_set():
-        cycle += 1
-        request_count += 1
+    try:
+        while not stop_event.is_set():
+            cycle += 1
+            if session_requests >= config.session_refresh_every:
+                session.close()
+                session = create_session(config)
+                session_requests = 0
+                logger.debug("HTTP session refreshed")
 
-        if (
-            request_count
-            >= config.session_refresh_every
-        ):
-            logger.info(
-                "Refreshing session..."
+            prices, retry_after, recreate = fetch_prices(
+                session, config, symbols, convert, breaker, metrics, logger, stop_event
             )
+            session_requests += 1
 
-            session.close()
-            session = create_session(
-                config
-            )
+            if recreate:
+                session.close()
+                session = create_session(config)
+                session_requests = 0
 
-            request_count = 0
+            if prices:
+                now_iso = datetime.now(timezone.utc).isoformat()
+                for symbol, price in prices.items():
+                    previous = last_prices.get(symbol)
+                    delta = ""
+                    if previous is not None and previous != 0:
+                        pct = (price - previous) / previous * Decimal("100")
+                        arrow = "↑" if pct > 0 else "↓" if pct < 0 else "→"
+                        delta = f" ({arrow} {pct:+.3f}%)"
+                    logger.info("[%s/%s] %s %s%s", symbol, convert, format_price(price), convert, delta)
+                    last_prices[symbol] = price
+                    cached[cache_key(symbol, convert)] = PricePoint(symbol, convert, price, now_iso)
 
-        price, retry_after = (
-            fetch_price(
-                session,
-                config,
-                symbol,
-                convert,
-                breaker,
-                logger,
-                metrics,
-                stop_event,
-            )
-        )
+                try:
+                    cache.save(cached)
+                except OSError as exc:
+                    logger.warning("Could not save cache: %s", exc)
 
-        if retry_after:
-            interval = min(
-                config.max_interval,
-                max(
-                    retry_after,
-                    interval
-                    + config.interval_step
-                ),
-            )
-
-        elif (
-            config.adaptive_interval
-            and interval
-            > config.min_interval
-        ):
-            interval = max(
-                config.min_interval,
-                interval - 1
-            )
-
-        if price is not None:
-            price = price.quantize(
-                Decimal("0.01"),
-                rounding=ROUND_HALF_UP,
-            )
-
-            delta_text = ""
-
-            if last_price:
-                diff = (
-                    (
-                        price
-                        - last_price
-                    )
-                    / last_price
-                ) * 100
-
-                arrow = (
-                    "↑"
-                    if diff > 0
-                    else "↓"
-                    if diff < 0
-                    else "→"
-                )
-
-                delta_text = (
-                    f" "
-                    f"({arrow} "
-                    f"{diff:+.2f}%)"
-                )
-
-            logger.info(
-                f"Price: "
-                f"${price:,.2f}"
-                f"{delta_text} | "
-                f"{metrics.summary()}"
-            )
-
-            last_price = price
-
-        else:
-            if last_price:
-                logger.warning(
-                    f"Using cached "
-                    f"price: "
-                    f"${last_price:,.2f}"
-                )
+                if config.adaptive_interval:
+                    current_interval = max(target_interval, current_interval - config.interval_step)
+                else:
+                    current_interval = target_interval
             else:
-                logger.error(
-                    "No price available"
+                for symbol in symbols:
+                    point = cached.get(cache_key(symbol, convert))
+                    if point is None:
+                        logger.error("[%s/%s] No current or cached price", symbol, convert)
+                        continue
+                    age = parse_iso_age(point.fetched_at)
+                    stale = age is None or age > config.cache_max_age
+                    age_text = "unknown" if age is None else f"{age:.0f}s"
+                    logger.warning(
+                        "[%s/%s] Cached price %s %s (age=%s%s)",
+                        symbol,
+                        convert,
+                        format_price(point.price),
+                        convert,
+                        age_text,
+                        ", stale" if stale else "",
+                    )
+
+                if config.adaptive_interval:
+                    suggested = retry_after or (current_interval + config.interval_step)
+                    current_interval = min(config.max_interval, max(config.min_interval, suggested))
+
+            if cycle % config.health_log_every == 0:
+                state, failures = breaker.snapshot()
+                logger.info(
+                    "Health | interval=%.1fs breaker=%s failures=%d | %s",
+                    current_interval,
+                    state.value,
+                    failures,
+                    metrics.summary(),
                 )
 
-        if (
-            cycle
-            % config.health_log_every
-            == 0
-        ):
-            logger.info(
-                f"Health | "
-                f"interval={interval}s | "
-                f"{metrics.summary()}"
-            )
-
-        stop_event.wait(interval)
-
-    session.close()
-    logger.info(
-        "Tracker stopped"
-    )
+            stop_event.wait(current_interval)
+    finally:
+        session.close()
+        logger.info("Tracker stopped | %s", metrics.summary())
 
 
-# ============================================================
-# CLI
-# ============================================================
+def parse_symbols(value: str) -> tuple[str, ...]:
+    symbols = tuple(dict.fromkeys(part.strip().upper() for part in value.split(",") if part.strip()))
+    if not symbols:
+        raise argparse.ArgumentTypeError("At least one symbol is required")
+    if len(symbols) > 100:
+        raise argparse.ArgumentTypeError("Too many symbols; maximum is 100")
+    return symbols
 
-def parse_arguments(
-    config: Config
-):
-    parser = argparse.ArgumentParser(
-        description=
-        "CoinMarketCap tracker"
-    )
 
-    parser.add_argument(
-        "--symbol",
-        default=config.default_symbol,
-    )
-
-    parser.add_argument(
-        "--convert",
-        default=config.default_convert,
-    )
-
-    parser.add_argument(
-        "--interval",
-        type=int,
-        default=config.default_interval,
-    )
-
-    parser.add_argument(
-        "--log-level",
-        default="INFO",
-        choices=[
-            "DEBUG",
-            "INFO",
-            "WARNING",
-            "ERROR",
-        ],
-    )
-
+def parse_arguments(config: Config) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Reliable CoinMarketCap multi-symbol price tracker")
+    parser.add_argument("--symbols", type=parse_symbols, default=config.default_symbols, help="Comma-separated symbols, e.g. BTC,ETH,SOL")
+    parser.add_argument("--convert", default=config.default_convert, help="Quote currency, e.g. USD or EUR")
+    parser.add_argument("--interval", type=float, default=config.default_interval)
+    parser.add_argument("--cache-file", type=Path, default=config.cache_file)
+    parser.add_argument("--log-file", type=Path, default=config.log_file)
+    parser.add_argument("--no-adaptive", action="store_true", help="Disable adaptive interval")
+    parser.add_argument("--log-level", default="INFO", choices=("DEBUG", "INFO", "WARNING", "ERROR"))
     args = parser.parse_args()
 
-    args.symbol = (
-        args.symbol.upper()
-    )
-
-    args.convert = (
-        args.convert.upper()
-    )
-
-    args.interval = max(
-        config.min_interval,
-        min(
-            args.interval,
-            config.max_interval,
-        ),
-    )
-
+    args.convert = args.convert.strip().upper()
+    if not args.convert:
+        parser.error("--convert cannot be empty")
+    if not config.min_interval <= args.interval <= config.max_interval:
+        parser.error(f"--interval must be between {config.min_interval} and {config.max_interval}")
     return args
 
 
-# ============================================================
-# MAIN
-# ============================================================
-
-def main():
+def main() -> int:
     config = load_config()
+    args = parse_arguments(config)
+    if not config.api_key:
+        print("Missing environment variable: CMC_API_KEY", file=sys.stderr)
+        return 2
+    config.cache_file = args.cache_file
+    config.log_file = args.log_file
+    config.adaptive_interval = not args.no_adaptive
+    logger = setup_logging(config, args.log_level)
 
-    args = parse_arguments(
-        config
-    )
-
-    logger = setup_logging(
-        config,
-        args.log_level,
-    )
-
-    track_prices(
-        config=config,
-        symbol=args.symbol,
-        convert=args.convert,
-        interval=args.interval,
-        logger=logger,
-    )
+    try:
+        track_prices(config, args.symbols, args.convert, args.interval, logger)
+        return 0
+    except Exception:
+        logger.exception("Unhandled fatal error")
+        return 1
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        sys.exit(0)
+    raise SystemExit(main())
