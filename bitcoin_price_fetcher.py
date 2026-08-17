@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CoinMarketCap Cryptocurrency Tracker v9
+CoinMarketCap Cryptocurrency Tracker v10
 
 Improvements over v8:
 - Counts real HTTP attempts instead of polling cycles.
@@ -12,10 +12,13 @@ Improvements over v8:
 - Cache schema validation and optional pruning of old entries.
 - Correct nearest-rank p95 calculation and separate operation/request metrics.
 - Honors Retry-After while capping unreasonable delays.
-- Recreates the HTTP session immediately after transport failures.
+- Recreates the HTTP session after an operation that encountered transport failures.
 - Uses fixed-rate polling semantics to avoid adding request duration to every interval.
 - Optional one-shot and JSON output modes for automation.
 - Graceful shutdown with interruptible retries and sleeps.
+- Keeps --json stdout machine-clean by routing logs to stderr.
+- Stops immediately on permanent API/auth/input errors instead of hammering the API forever.
+- Validates cache version/key/timestamps and fsyncs the cache directory after atomic replace.
 
 Required environment variable:
     CMC_API_KEY
@@ -51,7 +54,7 @@ from requests.exceptions import RequestException
 
 
 APP_NAME = "cmc-tracker"
-APP_VERSION = "9.0"
+APP_VERSION = "10.0"
 DEFAULT_API_URL = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest"
 DEFAULT_CACHE_FILE = "cmc_price_cache.json"
 DEFAULT_LOG_FILE = "cmc_tracker.log"
@@ -238,14 +241,19 @@ class ColorFormatter(logging.Formatter):
     }
     RESET = "\033[0m"
 
+    def __init__(self, fmt: str, stream: object) -> None:
+        super().__init__(fmt)
+        self.stream = stream
+
     def format(self, record: logging.LogRecord) -> str:
         message = super().format(record)
-        if not sys.stdout.isatty() or os.getenv("NO_COLOR"):
+        is_tty = bool(getattr(self.stream, "isatty", lambda: False)())
+        if not is_tty or os.getenv("NO_COLOR"):
             return message
         return f"{self.COLORS.get(record.levelno, '')}{message}{self.RESET}"
 
 
-def setup_logging(config: Config, level: str) -> logging.Logger:
+def setup_logging(config: Config, level: str, *, console_to_stderr: bool = False) -> logging.Logger:
     logger = logging.getLogger(APP_NAME)
     logger.setLevel(getattr(logging, level.upper(), logging.INFO))
     logger.propagate = False
@@ -262,8 +270,9 @@ def setup_logging(config: Config, level: str) -> logging.Logger:
     )
     file_handler.setFormatter(logging.Formatter(fmt))
 
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setFormatter(ColorFormatter(fmt))
+    console_stream = sys.stderr if console_to_stderr else sys.stdout
+    console_handler = logging.StreamHandler(console_stream)
+    console_handler.setFormatter(ColorFormatter(fmt, console_stream))
 
     logger.addHandler(file_handler)
     logger.addHandler(console_handler)
@@ -393,12 +402,29 @@ class PriceCache:
         self.logger = logger
         self._lock = threading.Lock()
 
+    def _cleanup_orphan_temps(self) -> None:
+        parent = self.path.parent
+        pattern = f".{self.path.name}.*.tmp"
+        try:
+            for candidate in parent.glob(pattern):
+                try:
+                    if candidate.is_file():
+                        candidate.unlink()
+                except OSError:
+                    self.logger.debug("Could not remove orphan cache temp %s", candidate)
+        except OSError:
+            pass
+
     def load(self) -> dict[str, PricePoint]:
         with self._lock:
+            self._cleanup_orphan_temps()
             try:
                 raw = json.loads(self.path.read_text(encoding="utf-8"))
                 if not isinstance(raw, Mapping):
                     raise ValueError("cache root must be an object")
+                version = raw.get("version")
+                if version != self.VERSION:
+                    raise ValueError(f"unsupported cache version: {version!r}")
                 raw_prices = raw.get("prices", {})
                 if not isinstance(raw_prices, Mapping):
                     raise ValueError("cache prices must be an object")
@@ -410,11 +436,16 @@ class PriceCache:
                         price = Decimal(str(item["price"]))
                         if not price.is_finite() or price < 0:
                             continue
+                        symbol = str(item["symbol"]).upper()
+                        convert = str(item["convert"]).upper()
+                        fetched_at = str(item["fetched_at"])
+                        if key != cache_key(symbol, convert) or parse_iso_age(fetched_at) is None:
+                            continue
                         result[key] = PricePoint(
-                            symbol=str(item["symbol"]).upper(),
-                            convert=str(item["convert"]).upper(),
+                            symbol=symbol,
+                            convert=convert,
                             price=price,
-                            fetched_at=str(item["fetched_at"]),
+                            fetched_at=fetched_at,
                         )
                     except (KeyError, TypeError, ValueError, InvalidOperation):
                         continue
@@ -438,12 +469,21 @@ class PriceCache:
         tmp = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
         with self._lock:
             self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._cleanup_orphan_temps()
             try:
                 with tmp.open("w", encoding="utf-8", newline="\n") as handle:
                     handle.write(encoded)
                     handle.flush()
                     os.fsync(handle.fileno())
                 os.replace(tmp, self.path)
+                try:
+                    dir_fd = os.open(str(self.path.parent), os.O_RDONLY)
+                    try:
+                        os.fsync(dir_fd)
+                    finally:
+                        os.close(dir_fd)
+                except OSError:
+                    pass
             finally:
                 try:
                     tmp.unlink(missing_ok=True)
@@ -863,8 +903,8 @@ def track_prices(
                 log_cached_prices(symbols, convert, cached, config, logger)
                 if result.permanent_error:
                     exit_code = 2
-                    if once:
-                        break
+                    logger.error("Stopping after permanent API error; retrying with unchanged inputs cannot recover")
+                    break
                 elif once:
                     exit_code = 1
                     break
@@ -944,7 +984,7 @@ def main() -> int:
         config.adaptive_interval = not args.no_adaptive
         config.verify_tls = not args.insecure
         config.validate()
-        logger = setup_logging(config, args.log_level)
+        logger = setup_logging(config, args.log_level, console_to_stderr=args.json)
     except ConfigError as exc:
         print(f"Configuration error: {exc}", file=sys.stderr)
         return 2
