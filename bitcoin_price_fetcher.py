@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CoinMarketCap Cryptocurrency Tracker v11
+CoinMarketCap Cryptocurrency Tracker v12
 
 Production-oriented single-process CMC price poller.
 
@@ -21,6 +21,9 @@ Key improvements over v10:
 - Adaptive interval increases after failures and decays toward the target after success.
 - JSON mode keeps stdout machine-readable; logs go to stderr.
 - Stronger CLI/environment validation and cleaner shutdown.
+- Implements numeric CMC ID queries end-to-end instead of merely accepting --ids.
+- Handles multiple CMC response shapes and fixes overdue fixed-rate scheduling.
+- Rejects materially future-dated cache timestamps.
 
 Required environment variable:
     CMC_API_KEY
@@ -51,7 +54,7 @@ from enum import Enum
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from statistics import fmean
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Sequence, TypeAlias
 from urllib.parse import urlparse
 
 import requests
@@ -60,12 +63,13 @@ from requests.adapters import HTTPAdapter
 from requests.exceptions import RequestException
 
 APP_NAME = "cmc-tracker"
-APP_VERSION = "11.0"
+APP_VERSION = "12.0"
 DEFAULT_API_URL = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest"
 DEFAULT_CACHE_FILE = "cmc_price_cache.json"
 DEFAULT_LOG_FILE = "cmc_tracker.log"
 RETRYABLE_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
 PERMANENT_AUTH_STATUS = frozenset({401, 403})
+Identifier: TypeAlias = str | int
 TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 FALSE_VALUES = frozenset({"0", "false", "no", "off"})
 # CMC's current docs list these structured errors as quota/rate-limit errors.
@@ -515,6 +519,9 @@ def parse_iso_age(timestamp: str) -> float | None:
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         age = (datetime.now(timezone.utc) - dt).total_seconds()
+        # A materially future-dated cache entry is corrupt or came from a bad clock.
+        if age < -300.0:
+            return None
         return max(0.0, age)
     except (TypeError, ValueError, OverflowError):
         return None
@@ -588,15 +595,40 @@ def extract_error(payload: Mapping[str, Any]) -> tuple[int, str] | None:
     return code, str(status.get("error_message") or f"CMC error {code}")
 
 
-def parse_prices(payload: Mapping[str, Any], symbols: Sequence[str], convert: str) -> tuple[dict[str, Decimal], tuple[str, ...]]:
+def _lookup_data_item(data: Mapping[str, Any], identifier: Identifier) -> Mapping[str, Any] | None:
+    """Find one CMC data item across v1/v2/v3 response shapes."""
+    key = str(identifier)
+    raw = data.get(key)
+    candidates = raw if isinstance(raw, list) else [raw]
+    for item in candidates:
+        if isinstance(item, Mapping):
+            return item
+
+    # Some endpoint revisions key `data` by symbol even for id queries (or vice versa).
+    for raw_item in data.values():
+        items = raw_item if isinstance(raw_item, list) else [raw_item]
+        for item in items:
+            if not isinstance(item, Mapping):
+                continue
+            if isinstance(identifier, int):
+                try:
+                    if int(item.get("id", -1)) == identifier:
+                        return item
+                except (TypeError, ValueError):
+                    pass
+            elif str(item.get("symbol", "")).upper() == identifier.upper():
+                return item
+    return None
+
+
+def parse_prices(
+    payload: Mapping[str, Any], identifiers: Sequence[Identifier], convert: str
+) -> tuple[dict[str, Decimal], tuple[str, ...]]:
     error = extract_error(payload)
     if error:
         code, message = error
         if code in RETRYABLE_CMC_CODES:
             raise RetryableError(f"CMC {code}: {message}")
-        if code in PERMANENT_CMC_CODES:
-            raise PermanentAPIError(f"CMC {code}: {message}")
-        # Unknown structured API errors are safer as permanent than as an infinite retry.
         raise PermanentAPIError(f"CMC {code}: {message}")
 
     data = payload.get("data")
@@ -605,26 +637,43 @@ def parse_prices(payload: Mapping[str, Any], symbols: Sequence[str], convert: st
 
     prices: dict[str, Decimal] = {}
     missing: list[str] = []
-    for symbol in symbols:
+    for identifier in identifiers:
+        label = str(identifier)
         try:
-            item = data[symbol]
-            if isinstance(item, list):
-                if len(item) != 1:
-                    raise KeyError(symbol)
-                item = item[0]
-            raw = item["quote"][convert]["price"]
-            value = Decimal(str(raw))
+            item = _lookup_data_item(data, identifier)
+            if item is None:
+                raise KeyError(label)
+            symbol = str(item.get("symbol") or label).strip().upper()
+            if not symbol:
+                raise KeyError(label)
+            quote = item["quote"]
+            if not isinstance(quote, Mapping):
+                raise KeyError(label)
+            quote_item = quote.get(convert)
+            if quote_item is None:
+                # Be tolerant of case differences in custom/older endpoints.
+                quote_item = next(
+                    (v for k, v in quote.items() if str(k).upper() == convert), None
+                )
+            if not isinstance(quote_item, Mapping):
+                raise KeyError(label)
+            value = Decimal(str(quote_item["price"]))
             if not value.is_finite() or value < 0:
                 raise InvalidOperation
             prices[symbol] = value
         except (KeyError, TypeError, ValueError, InvalidOperation):
-            missing.append(symbol)
+            missing.append(label)
     if not prices:
-        raise PermanentAPIError(f"No valid price data for: {', '.join(symbols)}")
+        raise PermanentAPIError(f"No valid price data for: {', '.join(map(str, identifiers))}")
     return prices, tuple(missing)
 
 
-def decode_response(response: Response, symbols: Sequence[str], convert: str, cfg: Config) -> tuple[dict[str, Decimal], tuple[str, ...]]:
+def decode_response(
+    response: Response,
+    identifiers: Sequence[Identifier],
+    convert: str,
+    cfg: Config,
+) -> tuple[dict[str, Decimal], tuple[str, ...]]:
     retry_after = parse_retry_after(response.headers.get("Retry-After"), cfg.max_retry_after)
     if response.status_code in RETRYABLE_STATUS:
         raise RetryableError(f"HTTP {response.status_code}", retry_after)
@@ -641,7 +690,7 @@ def decode_response(response: Response, symbols: Sequence[str], convert: str, cf
         raise RetryableError("Invalid JSON response") from exc
     if not isinstance(payload, Mapping):
         raise RetryableError("Unexpected JSON root type")
-    return parse_prices(payload, symbols, convert)
+    return parse_prices(payload, identifiers, convert)
 
 
 def interruptible_wait(stop_event: threading.Event, seconds: float) -> bool:
@@ -654,19 +703,22 @@ def interruptible_wait(stop_event: threading.Event, seconds: float) -> bool:
 def fetch_prices(
     session: Session,
     cfg: Config,
-    symbols: Sequence[str],
+    identifiers: Sequence[Identifier],
     convert: str,
     breaker: CircuitBreaker,
     metrics: Metrics,
     logger: logging.Logger,
     stop_event: threading.Event,
+    *,
+    id_mode: bool,
 ) -> FetchResult:
     allowed, wait = breaker.acquire()
     if not allowed:
         logger.warning("Circuit breaker %s; next probe in %.1fs", "OPEN/HALF_OPEN", wait)
         return FetchResult({}, retry_after=wait, circuit_open=True)
 
-    params = {"symbol": ",".join(symbols), "convert": convert, "skip_invalid": "true"}
+    key = "id" if id_mode else "symbol"
+    params = {key: ",".join(map(str, identifiers)), "convert": convert, "skip_invalid": "true"}
     requests_made = 0
     last_wait: float | None = None
     transport_failed = False
@@ -683,7 +735,7 @@ def fetch_prices(
             latency = time.perf_counter() - started
             requests_made += 1
             metrics.record_request(latency)
-            prices, missing = decode_response(response, symbols, convert, cfg)
+            prices, missing = decode_response(response, identifiers, convert, cfg)
             metrics.record_operation(True)
             breaker.success()
             logger.debug(
@@ -803,7 +855,10 @@ def install_signal_handlers(stop_event: threading.Event, logger: logging.Logger)
 # ---------- tracker ----------
 
 
-def track_prices(cfg: Config, symbols: Sequence[str], convert: str, target_interval: float, logger: logging.Logger, *, once: bool, json_output: bool) -> int:
+def track_prices(
+    cfg: Config, identifiers: Sequence[Identifier], convert: str, target_interval: float,
+    logger: logging.Logger, *, id_mode: bool, once: bool, json_output: bool
+) -> int:
     stop = threading.Event()
     install_signal_handlers(stop, logger)
     cache_store = PriceCache(cfg.cache_file, logger)
@@ -816,9 +871,10 @@ def track_prices(cfg: Config, symbols: Sequence[str], convert: str, target_inter
         except OSError as exc:
             logger.warning("Could not persist pruned cache: %s", exc)
 
+    requested_symbols = tuple(str(x).upper() for x in identifiers) if not id_mode else ()
     last_prices = {
         s: cache[cache_key(s, convert)].price
-        for s in symbols if cache_key(s, convert) in cache
+        for s in requested_symbols if cache_key(s, convert) in cache
     }
     session = create_session(cfg)
     breaker = CircuitBreaker(cfg.failure_threshold, cfg.recovery_time)
@@ -829,7 +885,7 @@ def track_prices(cfg: Config, symbols: Sequence[str], convert: str, target_inter
     exit_code = 0
     next_due = time.monotonic()
 
-    logger.info("Tracking %s in %s every %.1fs%s", ",".join(symbols), convert, target_interval, " (one-shot)" if once else "")
+    logger.info("Tracking %s=%s in %s every %.1fs%s", "ids" if id_mode else "symbols", ",".join(map(str, identifiers)), convert, target_interval, " (one-shot)" if once else "")
 
     try:
         while not stop.is_set():
@@ -844,7 +900,7 @@ def track_prices(cfg: Config, symbols: Sequence[str], convert: str, target_inter
                 session_requests = 0
                 logger.debug("HTTP session refreshed after request threshold")
 
-            result = fetch_prices(session, cfg, symbols, convert, breaker, metrics, logger, stop)
+            result = fetch_prices(session, cfg, identifiers, convert, breaker, metrics, logger, stop, id_mode=id_mode)
             session_requests += result.request_count
 
             if result.transport_failed:
@@ -862,7 +918,8 @@ def track_prices(cfg: Config, symbols: Sequence[str], convert: str, target_inter
                     cache[cache_key(symbol, convert)] = PricePoint(symbol, convert, price, ts)
                 if result.missing_symbols:
                     logger.warning("No valid current price for: %s", ", ".join(result.missing_symbols))
-                    log_cached_prices(result.missing_symbols, convert, cache, cfg, logger)
+                    if not id_mode:
+                        log_cached_prices(result.missing_symbols, convert, cache, cfg, logger)
                 try:
                     cache_store.save(cache)
                 except OSError as exc:
@@ -871,7 +928,8 @@ def track_prices(cfg: Config, symbols: Sequence[str], convert: str, target_inter
                     current_interval = max(target_interval, current_interval - cfg.interval_step)
             else:
                 if not result.circuit_open:
-                    log_cached_prices(symbols, convert, cache, cfg, logger)
+                    if not id_mode:
+                        log_cached_prices(tuple(map(str, identifiers)), convert, cache, cfg, logger)
                 if result.permanent_error:
                     exit_code = 2
                     logger.error("Stopping after permanent API error")
@@ -891,7 +949,12 @@ def track_prices(cfg: Config, symbols: Sequence[str], convert: str, target_inter
 
             # Fixed-rate schedule. If the operation took longer than the interval, skip
             # missed slots rather than firing a burst of immediately overdue requests.
-            next_due = max(next_due + current_interval, time.monotonic())
+            scheduled = next_due + current_interval
+            now = time.monotonic()
+            if scheduled <= now:
+                missed = math.floor((now - scheduled) / current_interval) + 1
+                scheduled += missed * current_interval
+            next_due = scheduled
 
     finally:
         session.close()
@@ -928,8 +991,9 @@ def parse_ids(value: str) -> tuple[int, ...]:
 
 def parse_arguments(cfg: Config) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Reliable CoinMarketCap price tracker", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    p.add_argument("--symbols", type=parse_symbols, default=cfg.default_symbols)
-    p.add_argument("--ids", type=parse_ids, default=cfg.default_ids, help="CMC numeric IDs; use with an API endpoint that accepts id")
+    identifiers = p.add_mutually_exclusive_group()
+    identifiers.add_argument("--symbols", type=parse_symbols, default=None)
+    identifiers.add_argument("--ids", type=parse_ids, default=None, help="CMC numeric IDs (recommended when supported by the endpoint)")
     p.add_argument("--convert", default=cfg.default_convert)
     p.add_argument("--interval", type=float, default=cfg.default_interval)
     p.add_argument("--cache-file", type=Path, default=cfg.cache_file)
@@ -947,9 +1011,6 @@ def parse_arguments(cfg: Config) -> argparse.Namespace:
         p.error("--convert must contain only letters, digits, or hyphens")
     if not math.isfinite(args.interval) or not cfg.min_interval <= args.interval <= cfg.max_interval:
         p.error(f"--interval must be between {cfg.min_interval} and {cfg.max_interval}")
-    if args.ids and len(args.ids) != len(args.symbols) and os.getenv("CMC_API_URL", DEFAULT_API_URL).rstrip("/").endswith("/v3/cryptocurrency/quotes/latest"):
-        # Not fatal: symbols and IDs are independent CLI modes, but prevent accidental ambiguity.
-        p.error("When using --ids with the v3 quotes endpoint, omit --symbols")
     return args
 
 
@@ -977,12 +1038,16 @@ def main() -> int:
         logger.warning("SOCKS proxy requires requests[socks]/PySocks to be installed")
 
     try:
-        # v10/v11 default is symbol mode. IDs are exposed for v3/custom endpoints;
-        # the v1 endpoint used here expects symbol parameters.
-        symbols = args.symbols
-        if args.ids:
-            logger.warning("--ids is accepted for forward compatibility; the default v1 endpoint still uses --symbols")
-        return track_prices(cfg, symbols, args.convert, args.interval, logger, once=args.once, json_output=args.json)
+        if args.ids is not None:
+            identifiers: Sequence[Identifier] = args.ids
+            id_mode = True
+        else:
+            identifiers = args.symbols if args.symbols is not None else cfg.default_symbols
+            id_mode = False
+        return track_prices(
+            cfg, identifiers, args.convert, args.interval, logger,
+            id_mode=id_mode, once=args.once, json_output=args.json
+        )
     except KeyboardInterrupt:
         logger.info("Interrupted by user")
         return 130
