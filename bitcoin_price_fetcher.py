@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CoinMarketCap Cryptocurrency Tracker v12
+CoinMarketCap Cryptocurrency Tracker v12.1
 
 Production-oriented single-process CMC price poller.
 
@@ -43,6 +43,7 @@ import os
 import random
 import signal
 import sys
+import tempfile
 import threading
 import time
 from collections import deque
@@ -63,7 +64,7 @@ from requests.adapters import HTTPAdapter
 from requests.exceptions import RequestException
 
 APP_NAME = "cmc-tracker"
-APP_VERSION = "12.0"
+APP_VERSION = "12.1"
 DEFAULT_API_URL = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest"
 DEFAULT_CACHE_FILE = "cmc_price_cache.json"
 DEFAULT_LOG_FILE = "cmc_tracker.log"
@@ -73,7 +74,7 @@ Identifier: TypeAlias = str | int
 TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 FALSE_VALUES = frozenset({"0", "false", "no", "off"})
 # CMC's current docs list these structured errors as quota/rate-limit errors.
-RETRYABLE_CMC_CODES = frozenset({1008})  # minute-rate limit in current CMC docs can vary by doc revision
+RETRYABLE_CMC_CODES = frozenset({1008, 1011})  # Per-minute / per-IP limits.
 PERMANENT_CMC_CODES = frozenset({
     1001, 1002, 1003, 1004, 1005, 1006, 1007, 1009, 1010,
 })
@@ -172,6 +173,14 @@ class Config:
             raise ConfigError("default_interval must be within min_interval and max_interval")
         if self.jitter_mode not in {"none", "full", "equal"}:
             raise ConfigError("jitter_mode must be one of: none, full, equal")
+        if self.proxy_url:
+            proxy = urlparse(self.proxy_url)
+            if proxy.scheme.lower() not in {"http", "https", "socks4", "socks4a", "socks5", "socks5h"} or not proxy.hostname:
+                raise ConfigError("CMC_PROXY_URL must be a valid HTTP(S) or SOCKS proxy URL")
+            try:
+                proxy.port
+            except ValueError as exc:
+                raise ConfigError("CMC_PROXY_URL has an invalid port") from exc
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -273,7 +282,9 @@ def setup_logging(cfg: Config, level: str, *, stderr: bool) -> logging.Logger:
     logger = logging.getLogger(APP_NAME)
     logger.setLevel(getattr(logging, level.upper(), logging.INFO))
     logger.propagate = False
-    logger.handlers.clear()
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+        handler.close()
     cfg.log_file.parent.mkdir(parents=True, exist_ok=True)
     fmt = "%(asctime)s | %(levelname)-8s | %(message)s"
     fh = RotatingFileHandler(
@@ -415,9 +426,12 @@ class PriceCache:
 
     def _cleanup_temps(self) -> None:
         try:
+            # Another tracker process may still be writing its own temporary file.
+            # Only remove old leftovers, never a potentially active writer's file.
+            cutoff = time.time() - 86400
             for p in self.path.parent.glob(f".{self.path.name}.*.tmp"):
                 try:
-                    if p.is_file():
+                    if p.is_file() and p.stat().st_mtime < cutoff:
                         p.unlink()
                 except OSError:
                     pass
@@ -469,19 +483,23 @@ class PriceCache:
         encoded = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._lock:
-            tmp = self.path.with_name(f".{self.path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+            # mkstemp provides a unique name even when several processes share a cache.
+            fd, name = tempfile.mkstemp(
+                prefix=f".{self.path.name}.", suffix=".tmp", dir=self.path.parent
+            )
+            tmp = Path(name)
             try:
-                with tmp.open("w", encoding="utf-8", newline="\n") as fh:
+                with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
                     fh.write(encoded)
                     fh.flush()
                     os.fsync(fh.fileno())
                 os.replace(tmp, self.path)
                 try:
-                    fd = os.open(str(self.path.parent), os.O_RDONLY)
+                    dir_fd = os.open(str(self.path.parent), os.O_RDONLY)
                     try:
-                        os.fsync(fd)
+                        os.fsync(dir_fd)
                     finally:
-                        os.close(fd)
+                        os.close(dir_fd)
                 except OSError:
                     pass
             finally:
@@ -555,7 +573,8 @@ def create_session(cfg: Config) -> Session:
 
 
 def compute_backoff(attempt: int, cfg: Config) -> float:
-    base = min(cfg.backoff_factor * (2 ** max(0, attempt - 1)), cfg.max_backoff)
+    # Avoid enormous integer exponentiation for a misconfigured retry count.
+    base = min(cfg.backoff_factor * (2.0 ** min(max(0, attempt - 1), 1023)), cfg.max_backoff)
     if cfg.jitter_mode == "full":
         return random.uniform(0.0, base)
     if cfg.jitter_mode == "equal":
@@ -595,6 +614,25 @@ def extract_error(payload: Mapping[str, Any]) -> tuple[int, str] | None:
     return code, str(status.get("error_message") or f"CMC error {code}")
 
 
+def check_cmc_error(payload: Mapping[str, Any], retry_after: float | None = None) -> None:
+    error = extract_error(payload)
+    if error is None:
+        return
+    code, message = error
+    detail = f"CMC {code}: {message}"
+    if code in RETRYABLE_CMC_CODES:
+        # CMC minute limits normally reset after 60 seconds. Without a
+        # Retry-After header, a generic 1-2 second backoff can exhaust credits.
+        delay = 60.0 if code == 1008 and retry_after is None else retry_after
+        raise RetryableError(detail, delay)
+    # Daily/monthly quota exhaustion, auth and plan errors need operator action
+    # or a quota reset; do not endlessly retry HTTP 429 for these codes.
+    if code in PERMANENT_CMC_CODES:
+        raise PermanentAPIError(detail)
+    # Unknown structured codes should not be retried blindly (e.g. invalid input).
+    raise PermanentAPIError(f"Unrecognized {detail}")
+
+
 def _lookup_data_item(data: Mapping[str, Any], identifier: Identifier) -> Mapping[str, Any] | None:
     """Find one CMC data item across v1/v2/v3 response shapes."""
     key = str(identifier)
@@ -624,12 +662,7 @@ def _lookup_data_item(data: Mapping[str, Any], identifier: Identifier) -> Mappin
 def parse_prices(
     payload: Mapping[str, Any], identifiers: Sequence[Identifier], convert: str
 ) -> tuple[dict[str, Decimal], tuple[str, ...]]:
-    error = extract_error(payload)
-    if error:
-        code, message = error
-        if code in RETRYABLE_CMC_CODES:
-            raise RetryableError(f"CMC {code}: {message}")
-        raise PermanentAPIError(f"CMC {code}: {message}")
+    check_cmc_error(payload)
 
     data = payload.get("data")
     if not isinstance(data, Mapping):
@@ -675,21 +708,32 @@ def decode_response(
     cfg: Config,
 ) -> tuple[dict[str, Decimal], tuple[str, ...]]:
     retry_after = parse_retry_after(response.headers.get("Retry-After"), cfg.max_retry_after)
-    if response.status_code in RETRYABLE_STATUS:
-        raise RetryableError(f"HTTP {response.status_code}", retry_after)
-    if response.status_code in PERMANENT_AUTH_STATUS:
-        raise PermanentAPIError(f"HTTP {response.status_code}: check API key and plan permissions")
-    if response.status_code == 402:
+    status = response.status_code
+
+    # A 429 can mean a transient minute/IP limit OR an exhausted daily/monthly
+    # allocation. Inspect the structured code before deciding whether to retry.
+    payload: Any = None
+    if status == 429 or 200 <= status < 300:
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            if status == 429:
+                raise RetryableError("HTTP 429: invalid JSON response", retry_after) from exc
+            raise RetryableError("Invalid JSON response", retry_after) from exc
+        if isinstance(payload, Mapping):
+            check_cmc_error(payload, retry_after)
+
+    if status in RETRYABLE_STATUS:
+        raise RetryableError(f"HTTP {status}", retry_after)
+    if status in PERMANENT_AUTH_STATUS:
+        raise PermanentAPIError(f"HTTP {status}: check API key and plan permissions")
+    if status == 402:
         raise PermanentAPIError("HTTP 402: CMC account/payment/plan activation problem")
-    if not 200 <= response.status_code < 300:
+    if not 200 <= status < 300:
         detail = response.text[:300].replace("\r", " ").replace("\n", " ")
-        raise PermanentAPIError(f"HTTP {response.status_code}: {detail}")
-    try:
-        payload = response.json()
-    except ValueError as exc:
-        raise RetryableError("Invalid JSON response") from exc
+        raise PermanentAPIError(f"HTTP {status}: {detail}")
     if not isinstance(payload, Mapping):
-        raise RetryableError("Unexpected JSON root type")
+        raise RetryableError("Unexpected JSON root type", retry_after)
     return parse_prices(payload, identifiers, convert)
 
 
@@ -712,9 +756,11 @@ def fetch_prices(
     *,
     id_mode: bool,
 ) -> FetchResult:
+    if stop_event.is_set():
+        return FetchResult({})
     allowed, wait = breaker.acquire()
     if not allowed:
-        logger.warning("Circuit breaker %s; next probe in %.1fs", "OPEN/HALF_OPEN", wait)
+        logger.warning("Circuit breaker OPEN/HALF_OPEN; next probe in %.1fs", wait)
         return FetchResult({}, retry_after=wait, circuit_open=True)
 
     key = "id" if id_mode else "symbol"
@@ -724,6 +770,10 @@ def fetch_prices(
     transport_failed = False
 
     for attempt in range(1, cfg.max_retries + 1):
+        if stop_event.is_set():
+            breaker.cancel_probe()
+            return FetchResult({}, request_count=requests_made, transport_failed=transport_failed)
+
         started = time.perf_counter()
         try:
             response = session.get(
@@ -732,62 +782,52 @@ def fetch_prices(
                 timeout=cfg.timeout,
                 verify=cfg.verify_tls,
             )
-            latency = time.perf_counter() - started
-            requests_made += 1
-            metrics.record_request(latency)
-            prices, missing = decode_response(response, identifiers, convert, cfg)
-            metrics.record_operation(True)
-            breaker.success()
-            logger.debug(
-                "HTTP %s in %.3fs | credits=%s remaining=%s",
-                response.status_code,
-                latency,
-                response.headers.get("X-RateLimit-Credit-Count", "?"),
-                response.headers.get("X-RateLimit-Remaining", "?"),
-            )
-            return FetchResult(prices, missing, request_count=requests_made)
-
-        except PermanentAPIError as exc:
-            latency = time.perf_counter() - started
-            # A RequestException never reaches here; a response-based permanent error always
-            # has an actual HTTP attempt. Keep the guard for future decode changes.
-            if requests_made == 0:
-                requests_made += 1
-                metrics.record_request(latency)
-            metrics.record_operation(False)
-            breaker.cancel_probe()
-            logger.error("Permanent API error: %s", exc)
-            return FetchResult({}, permanent_error=str(exc), request_count=requests_made)
-
-        except RetryableError as exc:
-            latency = time.perf_counter() - started
-            if requests_made == 0 or requests_made < attempt:
-                # Every retryable HTTP attempt is a real request.
-                if requests_made < attempt:
-                    metrics.record_request(latency)
-            # requests_made is incremented only for response paths above; if a structured
-            # error raised after a response, it is already correct.
-            if requests_made < attempt:
-                requests_made = attempt
-            last_wait = exc.retry_after if exc.retry_after is not None else compute_backoff(attempt, cfg)
-            logger.warning("Attempt %d/%d failed: %s; retry in %.2fs", attempt, cfg.max_retries, exc, last_wait)
-
         except RequestException as exc:
-            latency = time.perf_counter() - started
             requests_made += 1
-            metrics.record_request(latency)
+            metrics.record_request(time.perf_counter() - started)
             transport_failed = True
             last_wait = compute_backoff(attempt, cfg)
-            logger.warning("Attempt %d/%d transport error: %s; retry in %.2fs", attempt, cfg.max_retries, exc, last_wait)
+            logger.warning("Attempt %d/%d transport error: %s", attempt, cfg.max_retries, exc)
+        else:
+            latency = time.perf_counter() - started
+            requests_made += 1
+            metrics.record_request(latency)
+            try:
+                prices, missing = decode_response(response, identifiers, convert, cfg)
+            except PermanentAPIError as exc:
+                metrics.record_operation(False)
+                breaker.cancel_probe()
+                logger.error("Permanent API error: %s", exc)
+                return FetchResult({}, permanent_error=str(exc), request_count=requests_made,
+                                   transport_failed=transport_failed)
+            except RetryableError as exc:
+                last_wait = exc.retry_after if exc.retry_after is not None else compute_backoff(attempt, cfg)
+                logger.warning("Attempt %d/%d failed: %s", attempt, cfg.max_retries, exc)
+            else:
+                metrics.record_operation(True)
+                breaker.success()
+                logger.debug(
+                    "HTTP %s in %.3fs | credits=%s remaining=%s",
+                    response.status_code,
+                    latency,
+                    response.headers.get("X-RateLimit-Credit-Count", "?"),
+                    response.headers.get("X-RateLimit-Remaining", "?"),
+                )
+                return FetchResult(prices, missing, request_count=requests_made,
+                                   transport_failed=transport_failed)
+            finally:
+                response.close()
 
         if attempt < cfg.max_retries:
+            logger.debug("Retrying after %.2fs", last_wait or 0.0)
             if interruptible_wait(stop_event, last_wait or 0.0):
                 breaker.cancel_probe()
                 return FetchResult({}, request_count=requests_made, transport_failed=transport_failed)
 
     metrics.record_operation(False)
     breaker.failure()
-    return FetchResult({}, retry_after=last_wait, request_count=requests_made, transport_failed=transport_failed)
+    return FetchResult({}, retry_after=last_wait, request_count=requests_made,
+                       transport_failed=transport_failed)
 
 
 # ---------- presentation ----------
@@ -872,9 +912,13 @@ def track_prices(
             logger.warning("Could not persist pruned cache: %s", exc)
 
     requested_symbols = tuple(str(x).upper() for x in identifiers) if not id_mode else ()
+    # Do not compare a fresh quote against a weeks-old cached quote.
     last_prices = {
         s: cache[cache_key(s, convert)].price
-        for s in requested_symbols if cache_key(s, convert) in cache
+        for s in requested_symbols
+        if cache_key(s, convert) in cache
+        and (age := parse_iso_age(cache[cache_key(s, convert)].fetched_at)) is not None
+        and age <= cfg.cache_max_age
     }
     session = create_session(cfg)
     breaker = CircuitBreaker(cfg.failure_threshold, cfg.recovery_time)
@@ -954,6 +998,11 @@ def track_prices(
             if scheduled <= now:
                 missed = math.floor((now - scheduled) / current_interval) + 1
                 scheduled += missed * current_interval
+            # Retry-After and circuit recovery are minimum delays from the
+            # *last* attempt. Enforce them even with --no-adaptive, and even if
+            # the value exceeds the normal maximum polling interval.
+            if not result.prices and result.retry_after is not None:
+                scheduled = max(scheduled, now + result.retry_after)
             next_due = scheduled
 
     finally:
@@ -1021,7 +1070,7 @@ def main() -> int:
         cfg.cache_file = args.cache_file.expanduser()
         cfg.log_file = args.log_file.expanduser()
         cfg.proxy_url = args.proxy.strip() if args.proxy else None
-        cfg.adaptive_interval = not args.no_adaptive
+        cfg.adaptive_interval = cfg.adaptive_interval and not args.no_adaptive
         cfg.verify_tls = not args.insecure
         cfg.validate()
         logger = setup_logging(cfg, args.log_level, stderr=args.json)
