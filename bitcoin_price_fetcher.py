@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CoinMarketCap Cryptocurrency Tracker v12.1
+CoinMarketCap Cryptocurrency Tracker v12.2
 
 Production-oriented single-process CMC price poller.
 
@@ -24,6 +24,11 @@ Key improvements over v10:
 - Implements numeric CMC ID queries end-to-end instead of merely accepting --ids.
 - Handles multiple CMC response shapes and fixes overdue fixed-rate scheduling.
 - Rejects materially future-dated cache timestamps.
+- Does not follow redirects with an API-key-bearing request.
+- Retries transient 5xx responses (including CDN-generated errors).
+- Limits circuit-breaker recovery probes to one actual HTTP attempt.
+- Checks structured CMC errors even when returned with a non-2xx status.
+- Validates returned asset identities before using their prices.
 
 Required environment variable:
     CMC_API_KEY
@@ -55,7 +60,7 @@ from enum import Enum
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from statistics import fmean
-from typing import Any, Mapping, Sequence, TypeAlias
+from typing import Any, Iterator, Mapping, Sequence, TypeAlias
 from urllib.parse import urlparse
 
 import requests
@@ -64,7 +69,7 @@ from requests.adapters import HTTPAdapter
 from requests.exceptions import RequestException
 
 APP_NAME = "cmc-tracker"
-APP_VERSION = "12.1"
+APP_VERSION = "12.2"
 DEFAULT_API_URL = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest"
 DEFAULT_CACHE_FILE = "cmc_price_cache.json"
 DEFAULT_LOG_FILE = "cmc_tracker.log"
@@ -607,7 +612,7 @@ def extract_error(payload: Mapping[str, Any]) -> tuple[int, str] | None:
     raw_code = status.get("error_code", 0)
     try:
         code = int(raw_code or 0)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         code = -1
     if code == 0:
         return None
@@ -633,30 +638,42 @@ def check_cmc_error(payload: Mapping[str, Any], retry_after: float | None = None
     raise PermanentAPIError(f"Unrecognized {detail}")
 
 
-def _lookup_data_item(data: Mapping[str, Any], identifier: Identifier) -> Mapping[str, Any] | None:
-    """Find one CMC data item across v1/v2/v3 response shapes."""
-    key = str(identifier)
-    raw = data.get(key)
-    candidates = raw if isinstance(raw, list) else [raw]
-    for item in candidates:
-        if isinstance(item, Mapping):
-            return item
+def _matching_data_items(
+    data: Mapping[str, Any], identifier: Identifier
+) -> Iterator[Mapping[str, Any]]:
+    """Yield matching CMC items, including alternatives in symbol-keyed lists.
 
-    # Some endpoint revisions key `data` by symbol even for id queries (or vice versa).
-    for raw_item in data.values():
-        items = raw_item if isinstance(raw_item, list) else [raw_item]
+    A matching dictionary key alone is not sufficient evidence: CMC endpoints
+    may key results by either symbol or ID, and a malformed/mismatched item
+    must never silently populate the cache under another requested asset.
+    """
+    key = str(identifier)
+    seen: set[int] = set()
+
+    def matches(item: Mapping[str, Any], *, direct: bool) -> bool:
+        if isinstance(identifier, int):
+            item_id = item.get("id")
+            if item_id is None:
+                return direct  # Compatibility with minimal, ID-keyed responses.
+            try:
+                return int(item_id) == identifier
+            except (ValueError, TypeError, OverflowError):
+                return False
+        symbol = item.get("symbol")
+        return (direct and symbol is None) or (
+            isinstance(symbol, str) and symbol.upper() == identifier.upper()
+        )
+
+    # Prefer the requested key, but do not accept items identifying a different coin.
+    # The fallback scan supports endpoint versions that choose different data keys.
+    for direct, raw in ((True, data.get(key)), *((False, v) for v in data.values())):
+        items = raw if isinstance(raw, list) else (raw,)
         for item in items:
-            if not isinstance(item, Mapping):
+            if not isinstance(item, Mapping) or id(item) in seen:
                 continue
-            if isinstance(identifier, int):
-                try:
-                    if int(item.get("id", -1)) == identifier:
-                        return item
-                except (TypeError, ValueError):
-                    pass
-            elif str(item.get("symbol", "")).upper() == identifier.upper():
-                return item
-    return None
+            seen.add(id(item))
+            if matches(item, direct=direct):
+                yield item
 
 
 def parse_prices(
@@ -672,29 +689,39 @@ def parse_prices(
     missing: list[str] = []
     for identifier in identifiers:
         label = str(identifier)
-        try:
-            item = _lookup_data_item(data, identifier)
-            if item is None:
-                raise KeyError(label)
-            symbol = str(item.get("symbol") or label).strip().upper()
-            if not symbol:
-                raise KeyError(label)
-            quote = item["quote"]
-            if not isinstance(quote, Mapping):
-                raise KeyError(label)
-            quote_item = quote.get(convert)
-            if quote_item is None:
-                # Be tolerant of case differences in custom/older endpoints.
-                quote_item = next(
-                    (v for k, v in quote.items() if str(k).upper() == convert), None
+        found = False
+        for item in _matching_data_items(data, identifier):
+            try:
+                symbol = str(item.get("symbol") or label).strip().upper()
+                if not symbol:
+                    continue
+                quote = item["quote"]
+                if not isinstance(quote, Mapping):
+                    continue
+                quote_item = quote.get(convert)
+                if quote_item is None:
+                    # Be tolerant of case differences in custom/older endpoints.
+                    quote_item = next(
+                        (v for k, v in quote.items() if str(k).upper() == convert), None
+                    )
+                if not isinstance(quote_item, Mapping):
+                    continue
+                value = Decimal(str(quote_item["price"]))
+                if not value.is_finite() or value < 0:
+                    continue
+            except (KeyError, TypeError, ValueError, InvalidOperation):
+                continue
+            # Different CMC IDs can legitimately share a symbol. Never silently
+            # replace an earlier price with another asset's quote.
+            if isinstance(identifier, int) and symbol in prices:
+                raise PermanentAPIError(
+                    f"Multiple requested IDs use symbol {symbol!r}; "
+                    "query these IDs separately to avoid ambiguous cache keys"
                 )
-            if not isinstance(quote_item, Mapping):
-                raise KeyError(label)
-            value = Decimal(str(quote_item["price"]))
-            if not value.is_finite() or value < 0:
-                raise InvalidOperation
             prices[symbol] = value
-        except (KeyError, TypeError, ValueError, InvalidOperation):
+            found = True
+            break
+        if not found:
             missing.append(label)
     if not prices:
         raise PermanentAPIError(f"No valid price data for: {', '.join(map(str, identifiers))}")
@@ -709,21 +736,26 @@ def decode_response(
 ) -> tuple[dict[str, Decimal], tuple[str, ...]]:
     retry_after = parse_retry_after(response.headers.get("Retry-After"), cfg.max_retry_after)
     status = response.status_code
+    if status == 429 and retry_after is None:
+        # Even without a CMC error code, rate-limit responses should not be
+        # retried in a tight exponential-backoff loop.
+        retry_after = min(60.0, cfg.max_retry_after)
 
-    # A 429 can mean a transient minute/IP limit OR an exhausted daily/monthly
-    # allocation. Inspect the structured code before deciding whether to retry.
+    # A quota/plan failure can arrive with HTTP 429, 5xx or even 200. Inspect
+    # structured errors before applying the generic HTTP status classification.
     payload: Any = None
-    if status == 429 or 200 <= status < 300:
-        try:
-            payload = response.json()
-        except ValueError as exc:
-            if status == 429:
-                raise RetryableError("HTTP 429: invalid JSON response", retry_after) from exc
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        if status == 429:
+            raise RetryableError("HTTP 429: invalid JSON response", retry_after) from exc
+        if 200 <= status < 300:
             raise RetryableError("Invalid JSON response", retry_after) from exc
-        if isinstance(payload, Mapping):
-            check_cmc_error(payload, retry_after)
+    if isinstance(payload, Mapping):
+        check_cmc_error(payload, retry_after)
 
-    if status in RETRYABLE_STATUS:
+    # CDN/proxy errors (e.g. 520/522/524) should not terminate the poller.
+    if status in RETRYABLE_STATUS or 500 <= status < 600:
         raise RetryableError(f"HTTP {status}", retry_after)
     if status in PERMANENT_AUTH_STATUS:
         raise PermanentAPIError(f"HTTP {status}: check API key and plan permissions")
@@ -769,7 +801,10 @@ def fetch_prices(
     last_wait: float | None = None
     transport_failed = False
 
-    for attempt in range(1, cfg.max_retries + 1):
+    # A HALF_OPEN probe must represent only one HTTP request. Running the full
+    # retry loop would hammer a service that the breaker is testing for recovery.
+    max_attempts = 1 if breaker.snapshot()[0] is CircuitState.HALF_OPEN else cfg.max_retries
+    for attempt in range(1, max_attempts + 1):
         if stop_event.is_set():
             breaker.cancel_probe()
             return FetchResult({}, request_count=requests_made, transport_failed=transport_failed)
@@ -781,13 +816,14 @@ def fetch_prices(
                 params=params,
                 timeout=cfg.timeout,
                 verify=cfg.verify_tls,
+                allow_redirects=False,  # Do not forward the API key to another host.
             )
         except RequestException as exc:
             requests_made += 1
             metrics.record_request(time.perf_counter() - started)
             transport_failed = True
             last_wait = compute_backoff(attempt, cfg)
-            logger.warning("Attempt %d/%d transport error: %s", attempt, cfg.max_retries, exc)
+            logger.warning("Attempt %d/%d transport error: %s", attempt, max_attempts, exc)
         else:
             latency = time.perf_counter() - started
             requests_made += 1
@@ -802,7 +838,7 @@ def fetch_prices(
                                    transport_failed=transport_failed)
             except RetryableError as exc:
                 last_wait = exc.retry_after if exc.retry_after is not None else compute_backoff(attempt, cfg)
-                logger.warning("Attempt %d/%d failed: %s", attempt, cfg.max_retries, exc)
+                logger.warning("Attempt %d/%d failed: %s", attempt, max_attempts, exc)
             else:
                 metrics.record_operation(True)
                 breaker.success()
@@ -818,7 +854,7 @@ def fetch_prices(
             finally:
                 response.close()
 
-        if attempt < cfg.max_retries:
+        if attempt < max_attempts:
             logger.debug("Retrying after %.2fs", last_wait or 0.0)
             if interruptible_wait(stop_event, last_wait or 0.0):
                 breaker.cancel_probe()
@@ -1071,7 +1107,7 @@ def main() -> int:
         cfg.log_file = args.log_file.expanduser()
         cfg.proxy_url = args.proxy.strip() if args.proxy else None
         cfg.adaptive_interval = cfg.adaptive_interval and not args.no_adaptive
-        cfg.verify_tls = not args.insecure
+        cfg.verify_tls = cfg.verify_tls and not args.insecure
         cfg.validate()
         logger = setup_logging(cfg, args.log_level, stderr=args.json)
     except ConfigError as exc:
